@@ -124,6 +124,15 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         // Add a small delay after connecting to ensure printer is ready
         await Future.delayed(Duration(milliseconds: 100));
 
+        // Send a ping command (e.g., ESC/POS DLE EOT 1 for printer status)
+        final pingCommand = Uint8List.fromList([0x10, 0x04, 0x01]);
+        _socket!.add(pingCommand);
+        await _socket!.flush();
+
+        // Wait for a response to confirm the printer is reachable
+        await _socket!.timeout(Duration(seconds: 2)).first;
+
+        // No timeout exceptions = likely alive
         return PrinterConnectStatusResult(isSuccess: true);
       } catch (e, stackTrace) {
         lastException = e is SocketException ? e : SocketException(e.toString());
