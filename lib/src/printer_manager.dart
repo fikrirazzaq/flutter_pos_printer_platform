@@ -4,6 +4,8 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_pos_printer_platform/flutter_pos_printer_platform.dart';
+import '../esc_pos_utils_platform/esc_pos_utils_platform.dart';
+import 'universal_chinese_printer.dart';
 
 enum PrinterType { bluetooth, usb, network }
 
@@ -21,6 +23,8 @@ class PrinterManager {
   static PrinterManager get instance => _instance;
 
   static Function(String message, {String? level, dynamic error, StackTrace? stackTrace})? logCallback;
+
+  static Map<String, Map<String, int>> _printerConfigs = {};
 
   void _log(String message, {String level = 'info', dynamic error, StackTrace? stackTrace}) {
     if (level == 'error') {
@@ -238,6 +242,163 @@ class PrinterManager {
       }
       return disconnected;
     }
+  }
+
+  Future<bool> printChineseTextUniversal(String chineseText, PrinterType printerType, BasePrinterInput model,
+      {bool autoDetect = true}) async {
+    try {
+      String printerKey = _getPrinterKey(model);
+      Map<String, int>? config = _printerConfigs[printerKey];
+
+      // Auto-detect optimal settings if not cached
+      if (config == null && autoDetect) {
+        _log('Auto-detecting Chinese settings for printer: $printerKey');
+        config = await UniversalChinesePrinter.autoConfigureChinesePrinting(this, printerType, model);
+        _printerConfigs[printerKey] = config;
+        _log('Detected config: $config');
+      }
+
+      // Use detected or default configuration
+      int chineseModeAttempt = config?['chineseModeAttempt'] ?? 1;
+      int encodingAttempt = config?['encodingAttempt'] ?? 1;
+
+      // Create generator
+      final profile = await CapabilityProfile.load(name: 'default');
+      final generator = Generator(PaperSize.mm80, profile);
+
+      List<int> bytes = [];
+
+      // Initialize printer
+      bytes += generator.reset();
+
+      // Print Chinese text with optimal settings
+      bytes += generator.textMixed(
+        chineseText,
+        styles: const PosStyles(
+          align: PosAlign.center,
+          height: PosTextSize.size1,
+          width: PosTextSize.size1,
+        ),
+        chineseModeAttempt: chineseModeAttempt,
+        encodingAttempt: encodingAttempt,
+      );
+
+      // Cut paper
+      bytes += generator.cut();
+
+      // Connect and send
+      final connectResult = await connect(type: printerType, model: model);
+      if (!connectResult.isSuccess) {
+        return false;
+      }
+
+      final sendResult = await send(type: printerType, bytes: bytes, model: model);
+
+      // Disconnect
+      await disconnect(type: printerType);
+
+      return sendResult.isSuccess;
+    } catch (e) {
+      _log('Universal Chinese printing failed: $e', level: 'error');
+      return false;
+    }
+  }
+
+  Future<bool> printMixedText(
+    String mixedText,
+    PrinterType printerType,
+    BasePrinterInput model, {
+    PosStyles? styles,
+    bool autoDetect = true,
+  }) async {
+    try {
+      String printerKey = _getPrinterKey(model);
+      Map<String, int>? config = _printerConfigs[printerKey];
+
+      // Auto-detect optimal settings if not cached
+      if (config == null && autoDetect) {
+        _log('Auto-detecting mixed text settings for printer: $printerKey');
+        config = await UniversalChinesePrinter.autoConfigureChinesePrinting(this, printerType, model);
+        _printerConfigs[printerKey] = config;
+        _log('Detected config: $config');
+      }
+
+      // Use detected or default configuration
+      int chineseModeAttempt = config?['chineseModeAttempt'] ?? 1;
+      int encodingAttempt = config?['encodingAttempt'] ?? 1;
+
+      // Create generator
+      final profile = await CapabilityProfile.load(name: 'default');
+      final generator = Generator(PaperSize.mm80, profile);
+
+      List<int> bytes = [];
+
+      // Initialize printer
+      bytes += generator.reset();
+
+      // Print mixed text with optimal settings
+      bytes += generator.textMixed(
+        mixedText,
+        styles: styles ??
+            const PosStyles(
+              align: PosAlign.left,
+              height: PosTextSize.size1,
+              width: PosTextSize.size1,
+            ),
+        chineseModeAttempt: chineseModeAttempt,
+        encodingAttempt: encodingAttempt,
+      );
+
+      // Cut paper
+      bytes += generator.cut();
+
+      // Connect and send
+      final connectResult = await connect(type: printerType, model: model);
+      if (!connectResult.isSuccess) {
+        return false;
+      }
+
+      final sendResult = await send(type: printerType, bytes: bytes, model: model);
+
+      // Disconnect
+      await disconnect(type: printerType);
+
+      return sendResult.isSuccess;
+    } catch (e) {
+      _log('Mixed text printing failed: $e', level: 'error');
+      return false;
+    }
+  }
+
+  // Generate unique printer identifier
+  String _getPrinterKey(BasePrinterInput model) {
+    if (model is TcpPrinterInput) {
+      return '${model.ipAddress}';
+    } else if (model is BluetoothPrinterInput) {
+      return '${model.address}';
+    } else if (model is UsbPrinterInput) {
+      return '${model.vendorId}_${model.productId}';
+    }
+    return model.toString();
+  }
+
+  // Manual configuration for specific printers
+  void setChineseConfig(BasePrinterInput model, int chineseModeAttempt, int encodingAttempt) {
+    String printerKey = _getPrinterKey(model);
+    _printerConfigs[printerKey] = {
+      'chineseModeAttempt': chineseModeAttempt,
+      'encodingAttempt': encodingAttempt,
+    };
+  }
+
+  // Get cached configuration
+  Map<String, int>? getChineseConfig(BasePrinterInput model) {
+    return _printerConfigs[_getPrinterKey(model)];
+  }
+
+  // Clear cached configurations
+  void clearChineseConfigs() {
+    _printerConfigs.clear();
   }
 
   Stream<BTStatus> get stateBluetooth => bluetoothPrinterConnector.currentStatus.cast<BTStatus>();

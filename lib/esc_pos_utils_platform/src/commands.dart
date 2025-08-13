@@ -66,3 +66,24 @@ const cCashDrawerPin5 = '${esc}p130';
 
 // QR Code
 const cQrHeader = '$gs(k';
+
+// Chinese Character Commands for Epson printers
+const cChineseModeOn = '$fs&';
+const cChineseModeOff = '$fs.';
+const cChineseFontA = '${fs}C\x00';
+const cChineseFontB = '${fs}C\x01';
+const cChineseFontC = '${fs}C\x02';
+
+// Chinese Commands Class
+class ChineseCommands {
+  static const epsonChineseModeOn = '$fs&';
+  static const epsonChineseModeOff = '$fs.';
+  static const epsonChineseFontA = '${fs}C\x00';
+  static const epsonChineseFontB = '${fs}C\x01';
+  static const kanjiModeOn = '$fs&';
+  static const kanjiModeOff = '$fs.';
+  static const chineseCodePage255 = 255;
+  static const chineseCodePage1 = 1;
+  static const altChineseModeOn = '${esc}\x1C&';
+  static const altChineseModeOff = '${esc}\x1C.';
+}

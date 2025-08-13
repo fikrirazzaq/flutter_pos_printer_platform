@@ -10,3 +10,5 @@ export './src/printers/tspl.dart';
 export './printer.dart';
 export './src/printer_manager.dart';
 export './src/models/printer_device.dart';
+export './src/mixed_text_examples.dart';
+export './src/universal_chinese_printer.dart';

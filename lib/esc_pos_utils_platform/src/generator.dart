@@ -14,6 +14,7 @@ import 'package:gbk_codec/gbk_codec.dart';
 import "package:hex/hex.dart";
 import '../esc_pos_utils_platform.dart';
 import 'commands.dart';
+import 'mixed_text_processor.dart';
 
 class Generator {
   Generator(this._paperSize, this._profile, {this.spaceBetweenRows = 5});
@@ -71,18 +72,24 @@ class Generator {
   Uint8List _encode(String text, {bool isKanji = false}) {
     // replace some non-ascii characters
     text = text
-        .replaceAll("’", "'")
+        .replaceAll("'", "'")
         .replaceAll("´", "'")
         .replaceAll("»", '"')
         .replaceAll(" ", ' ')
         .replaceAll("•", '.')
         .replaceNonAscii();
+
     if (!isKanji) {
       text = text.replaceNonPrintable(replaceWith: '');
       return latin1.encode(text);
     } else {
-      return utf8.encode(text);
-      return Uint8List.fromList(gbk_bytes.encode(text));
+      // For Chinese characters, use GBK encoding (maybe required for Epson printers)
+      try {
+        return Uint8List.fromList(gbk_bytes.encode(text));
+      } catch (e) {
+        // Fallback to UTF-8 if GBK encoding fails (for Rongta compatibility)
+        return utf8.encode(text);
+      }
     }
   }
 
@@ -266,8 +273,9 @@ class Generator {
     return bytes;
   }
 
-  List<int> setStyles(PosStyles styles, {bool isKanji = false}) {
+  List<int> setStyles(PosStyles styles, {bool isKanji = false, int chineseModeAttempt = 1}) {
     List<int> bytes = List.empty(growable: true);
+
     if (styles.align != _styles.align) {
       bytes += latin1.encode(
           styles.align == PosAlign.left ? cAlignLeft : (styles.align == PosAlign.center ? cAlignCenter : cAlignRight));
@@ -278,14 +286,17 @@ class Generator {
       bytes += styles.bold ? cBoldOn.codeUnits : cBoldOff.codeUnits;
       _styles = _styles.copyWith(bold: styles.bold);
     }
+
     if (styles.turn90 != _styles.turn90) {
       bytes += styles.turn90 ? cTurn90On.codeUnits : cTurn90Off.codeUnits;
       _styles = _styles.copyWith(turn90: styles.turn90);
     }
+
     if (styles.reverse != _styles.reverse) {
       bytes += styles.reverse ? cReverseOn.codeUnits : cReverseOff.codeUnits;
       _styles = _styles.copyWith(reverse: styles.reverse);
     }
+
     if (styles.underline != _styles.underline) {
       bytes += styles.underline ? cUnderline1dot.codeUnits : cUnderlineOff.codeUnits;
       _styles = _styles.copyWith(underline: styles.underline);
@@ -308,11 +319,11 @@ class Generator {
       _styles = _styles.copyWith(height: styles.height, width: styles.width);
     }
 
-    // Set Kanji mode
+    // Universal Chinese mode activation - try different methods based on attempt
     if (isKanji) {
-      bytes += cKanjiOn.codeUnits;
+      bytes += _activateChineseMode(enable: true, attempt: chineseModeAttempt);
     } else {
-      bytes += cKanjiOff.codeUnits;
+      bytes += _activateChineseMode(enable: false, attempt: chineseModeAttempt);
     }
 
     // Set local code table
@@ -349,6 +360,7 @@ class Generator {
     int? maxCharsPerLine,
   }) {
     List<int> bytes = List.empty(growable: true);
+
     if (!containsChinese) {
       bytes += _text(
         _encode(text, isKanji: containsChinese),
@@ -359,8 +371,11 @@ class Generator {
       // Ensure at least one line break after the text
       bytes += emptyLines(linesAfter + 1);
     } else {
-      bytes += _mixedKanji(text/*.replaceNonAscii().replaceNonPrintable(replaceWith: '')*/,
-          styles: styles, linesAfter: linesAfter);
+      bytes += _mixedKanji(
+        text,
+        styles: styles,
+        linesAfter: linesAfter,
+      );
     }
     return bytes;
   }
@@ -713,15 +728,16 @@ class Generator {
     bool isKanji = false,
     int colWidth = 12,
     int? maxCharsPerLine,
+    int chineseModeAttempt = 1,
   }) {
     List<int> bytes = List.empty(growable: true);
+
     if (colInd != null) {
       double charWidth = _getCharWidth(styles, maxCharsPerLine: maxCharsPerLine);
       double fromPos = _colIndToPosition(colInd);
 
       // Align
       if (colWidth != 12) {
-        // Update fromPos
         final double toPos = _colIndToPosition(colInd + colWidth) - spaceBetweenRows;
         final double textLen = textBytes.length * charWidth;
 
@@ -744,8 +760,7 @@ class Generator {
       );
     }
 
-    bytes += setStyles(styles, isKanji: isKanji);
-
+    bytes += setStyles(styles, isKanji: isKanji, chineseModeAttempt: chineseModeAttempt);
     bytes += textBytes;
     return bytes;
   }
@@ -756,27 +771,177 @@ class Generator {
     PosStyles styles = const PosStyles(),
     int linesAfter = 0,
     int? maxCharsPerLine,
+    int chineseModeAttempt = 1,
+    int encodingAttempt = 1,
   }) {
     List<int> bytes = List.empty(growable: true);
-    final list = _getLexemes(text, containsChinese: true);
-    final List<String> lexemes = list[0];
-    final List<bool> isLexemeChinese = list[1];
 
-    // Print each lexeme using codetable OR kanji
+    // Use the enhanced lexeme analysis for better mixed text support
+    final list = MixedTextProcessor.getLexemesAdvanced(text);
+    final List<String> lexemes = list[0];
+    final List<String> lexemeTypes = list[1];
+
+    // Print each lexeme using appropriate encoding and mode
     int? colInd = 0;
     for (var i = 0; i < lexemes.length; ++i) {
+      String lexeme = lexemes[i];
+      String type = lexemeTypes[i];
+
+      // Determine if this lexeme is Asian (Chinese/Japanese/Korean)
+      bool isAsianLexeme = ['chinese', 'japanese', 'korean'].contains(type);
+
+      // Encode based on character type with fallback options
+      Uint8List encodedText;
+      if (isAsianLexeme) {
+        // Use advanced encoding for Asian characters
+        encodedText = MixedTextEncoder.encodeByType(lexeme, type, encodingAttempt: encodingAttempt);
+      } else {
+        // Use standard encoding for Latin characters
+        encodedText = _encode(lexeme, isKanji: false);
+      }
+
       bytes += _text(
-        _encode(lexemes[i], isKanji: isLexemeChinese[i]),
+        encodedText,
         styles: styles,
         colInd: colInd,
-        isKanji: isLexemeChinese[i],
+        isKanji: isAsianLexeme,
         maxCharsPerLine: maxCharsPerLine,
+        chineseModeAttempt: chineseModeAttempt,
       );
+
       // Define the absolute position only once (we print one line only)
       colInd = null;
     }
 
     bytes += emptyLines(linesAfter + 1);
+    return bytes;
+  }
+
+  List<int> textMixed(
+    String text, {
+    PosStyles styles = const PosStyles(),
+    int linesAfter = 0,
+    int? maxCharsPerLine,
+    int? chineseModeAttempt,
+    int? encodingAttempt,
+  }) {
+    // Auto-detect if text contains Asian characters
+    bool containsAsian = text.split('').any((char) => MixedTextProcessor.isAsianCharacter(char));
+
+    if (!containsAsian) {
+      // Pure Latin text - use standard encoding
+      List<int> bytes = List.empty(growable: true);
+      bytes += _text(
+        _encode(text, isKanji: false),
+        styles: styles,
+        isKanji: false,
+        maxCharsPerLine: maxCharsPerLine,
+        chineseModeAttempt: chineseModeAttempt ?? 1,
+      );
+      bytes += emptyLines(linesAfter + 1);
+      return bytes;
+    } else {
+      // Mixed or Asian text - use advanced processing
+      return _mixedTextAdvanced(
+        text,
+        styles: styles,
+        linesAfter: linesAfter,
+        maxCharsPerLine: maxCharsPerLine,
+        chineseModeAttempt: chineseModeAttempt ?? 1,
+        encodingAttempt: encodingAttempt ?? 1,
+      );
+    }
+  }
+
+  List<int> _mixedTextAdvanced(
+    String text, {
+    PosStyles styles = const PosStyles(),
+    int linesAfter = 0,
+    int? maxCharsPerLine,
+    int chineseModeAttempt = 1,
+    int encodingAttempt = 1,
+  }) {
+    List<int> bytes = List.empty(growable: true);
+
+    // Parse text into lexemes with type information
+    final analysis = MixedTextProcessor.getLexemesAdvanced(text);
+    final List<String> lexemes = analysis[0];
+    final List<String> lexemeTypes = analysis[1];
+
+    int? colInd = 0;
+
+    for (int i = 0; i < lexemes.length; i++) {
+      String lexeme = lexemes[i];
+      String type = lexemeTypes[i];
+
+      bool isAsianLexeme = ['chinese', 'japanese', 'korean'].contains(type);
+
+      // Encode based on character type
+      Uint8List encodedText = MixedTextEncoder.encodeByType(lexeme, type, encodingAttempt: encodingAttempt);
+
+      // Print with appropriate mode
+      bytes += _text(
+        encodedText,
+        styles: styles,
+        colInd: colInd,
+        isKanji: isAsianLexeme,
+        maxCharsPerLine: maxCharsPerLine,
+        chineseModeAttempt: chineseModeAttempt,
+      );
+
+      // Only set position once per line
+      colInd = null;
+    }
+
+    bytes += emptyLines(linesAfter + 1);
+    return bytes;
+  }
+
+  List<int> _activateChineseMode({required bool enable, int attempt = 1}) {
+    List<int> bytes = [];
+
+    if (enable) {
+      switch (attempt) {
+        case 1: // Standard ESC/POS approach (works for most printers)
+          bytes += ChineseCommands.epsonChineseModeOn.codeUnits; // FS &
+          bytes += ChineseCommands.epsonChineseFontA.codeUnits; // FS C 0
+          break;
+        case 2: // Alternative Kanji mode
+          bytes += ChineseCommands.kanjiModeOn.codeUnits;
+          break;
+        case 3: // Code page approach
+          bytes += Uint8List.fromList(
+            List.from(cCodeTable.codeUnits)..add(ChineseCommands.chineseCodePage255),
+          );
+          break;
+        case 4: // Alternative command set
+          bytes += ChineseCommands.altChineseModeOn.codeUnits;
+          break;
+        default: // Minimal approach
+          bytes += ChineseCommands.kanjiModeOn.codeUnits;
+      }
+    } else {
+      switch (attempt) {
+        case 1:
+          bytes += ChineseCommands.epsonChineseModeOff.codeUnits;
+          break;
+        case 2:
+          bytes += ChineseCommands.kanjiModeOff.codeUnits;
+          break;
+        case 3:
+          // Reset to default code page
+          bytes += Uint8List.fromList(
+            List.from(cCodeTable.codeUnits)..add(0), // CP437
+          );
+          break;
+        case 4:
+          bytes += ChineseCommands.altChineseModeOff.codeUnits;
+          break;
+        default:
+          bytes += ChineseCommands.kanjiModeOff.codeUnits;
+      }
+    }
+
     return bytes;
   }
 // ************************ (end) Internal command generators ************************
