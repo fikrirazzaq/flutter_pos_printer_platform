@@ -350,7 +350,20 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
           }
         } else {
           // Small enough section to send at once
-          validSocket.add(Uint8List.fromList(section));
+          try {
+            validSocket.add(Uint8List.fromList(section));
+          } catch (e, s) {
+            if (e.toString().contains('StreamSink is closed')) {
+              if (model != null) {
+                _log('Split send try to reconnect after StreamSink is closed i:$i $extraLog', level: 'error', error: e, stackTrace: s);
+                useDedicatedSocket ? await connectDedicatedSocket(model) : await connect(model);
+              }
+              socketConnection = useDedicatedSocket ? socketsPerIp[model?.ipAddress] : _socket;
+              if (socketConnection == null) throw SocketException('Socket is null');
+              validSocket = socketConnection;
+              validSocket.add(Uint8List.fromList(section));
+            }
+          }
           _log('5. Sent small section print ${i + 1}/${bytes.length}, section size: ${bytes[i].length} bytes $extraLog',
               level: 'info');
 
@@ -457,8 +470,9 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
           });
 
           socketClosed = true;
-        } catch (e) {
-          _log('${printerIp != null ? '$printerIp ' : ''}Error during socket close: $e', level: 'error', error: e);
+        } catch (e, s) {
+          _log('${printerIp != null ? '$printerIp ' : ''}Error during socket close: $e',
+              level: 'error', error: e, stackTrace: s);
         }
 
         // Always destroy the socket even if close fails
