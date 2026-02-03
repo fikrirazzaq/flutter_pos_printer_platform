@@ -21,6 +21,7 @@ class PosStyles {
     this.fontType,
     this.fontColor = PosFontColor.black,
     this.codeTable,
+    this.isKanji = false,
   });
 
   // Init all fields with default values
@@ -35,6 +36,7 @@ class PosStyles {
     this.fontType = PosFontType.fontA,
     this.fontColor = PosFontColor.black,
     this.codeTable = "CP437",
+    this.isKanji = false
   });
 
   final bool bold;
@@ -47,6 +49,7 @@ class PosStyles {
   final PosFontType? fontType;
   final PosFontColor? fontColor;
   final String? codeTable;
+  final bool isKanji;
 
   PosStyles copyWith({
     bool? bold,
@@ -59,6 +62,7 @@ class PosStyles {
     PosFontType? fontType,
     PosFontColor? fontColor,
     String? codeTable,
+    bool? isKanji,
   }) {
     return PosStyles(
       bold: bold ?? this.bold,
@@ -71,6 +75,7 @@ class PosStyles {
       fontType: fontType ?? this.fontType,
       fontColor: fontColor ?? this.fontColor,
       codeTable: codeTable ?? this.codeTable,
+      isKanji: isKanji ?? this.isKanji,
     );
   }
 }

@@ -23,6 +23,7 @@ const cReverseOn = '${gs}B\x01'; // Turn white/black reverse print mode on
 const cReverseOff = '${gs}B\x00'; // Turn white/black reverse print mode off
 const cSizeGSn = '$gs!'; // Select character size [N]
 const cSizeESCn = '$esc!'; // Select character size [N]
+const cSizeFSn = '${fs}!'; // Select character size [N]
 const cUnderlineOff = '$esc-\x00'; // Turns off underline mode
 const cUnderline1dot = '$esc-\x01'; // Turns on underline mode (1-dot thick)
 const cUnderline2dots = '$esc-\x02'; // Turns on underline mode (2-dots thick)

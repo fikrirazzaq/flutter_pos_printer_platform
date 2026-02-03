@@ -31,6 +31,9 @@ class PosTextSize {
 
   static int decSize(PosTextSize height, PosTextSize width) =>
       16 * (width.value - 1) + (height.value - 1);
+
+  static int kanjiDecSize(PosTextSize height, PosTextSize width) =>
+      4 * (width.value - 1) + (height.value - 1);
 }
 
 class PaperSize {
