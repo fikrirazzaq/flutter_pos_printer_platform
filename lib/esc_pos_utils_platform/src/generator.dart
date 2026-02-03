@@ -403,9 +403,9 @@ class Generator {
     }
 
     if (styles.align != _styles.align) {
-      bytes += latin1.encode(styles.align == PosAlign.left
-          ? cAlignLeft
-          : (styles.align == PosAlign.center ? cAlignCenter : cAlignRight));
+      bytes += (styles.align == PosAlign.left
+          ? cAlignLeftDotMatrix
+          : (styles.align == PosAlign.center ? cAlignCenterDotMatrix : cAlignRightDotMatrix)).codeUnits;
       _styles = _styles.copyWith(align: styles.align);
     }
 
@@ -874,7 +874,7 @@ class Generator {
       bool isDotMatrix = false}) {
     List<int> bytes = List.empty(growable: true);
 
-    if (colInd != null) {
+    if (!isDotMatrix && colInd != null) {
       double charWidth =
           _getCharWidth(styles, maxCharsPerLine: maxCharsPerLine);
       double fromPos = _colIndToPosition(colInd);
