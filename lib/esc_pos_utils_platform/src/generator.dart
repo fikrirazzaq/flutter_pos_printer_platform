@@ -288,9 +288,9 @@ class Generator {
   }
 
   List<int> setStyles(PosStyles styles,
-      {bool isKanji = false, bool isDotMatrix = false}) {
+      {bool isKanji = false, bool isDotMatrix = false, bool legacySizing = false}) {
     return isDotMatrix
-        ? _setStylesDotMatrix(styles, isKanji: isKanji)
+        ? _setStylesDotMatrix(styles, isKanji: isKanji, legacySizing: legacySizing)
         : _setStyles(styles, isKanji: isKanji);
   }
 
@@ -368,7 +368,7 @@ class Generator {
     return bytes;
   }
 
-  List<int> _setStylesDotMatrix(PosStyles styles, {bool isKanji = false}) {
+  List<int> _setStylesDotMatrix(PosStyles styles, {bool isKanji = false, bool legacySizing = false}) {
     List<int> bytes = List.empty(growable: true);
 
     bool isReset = false;
@@ -392,13 +392,27 @@ class Generator {
     // Characters size
     if ((styles.height.value != _styles.height.value ||
         styles.width.value != _styles.width.value) ||
-        isKanji != styles.isKanji) {
-      bytes += Uint8List.fromList(
-        List.from(isKanji ? cSizeFSn.codeUnits : cSizeESCn.codeUnits)
-          ..add(isKanji
-              ? PosTextSize.kanjiDecSize(styles.height, styles.width)
-              : PosTextSize.decSize(styles.height, styles.width)),
-      );
+        styles.bold != _styles.bold ||
+        isKanji != _styles.isKanji) {
+        if (legacySizing) {
+          bytes += Uint8List.fromList(
+            List.from(cSizeGSn.codeUnits)
+              ..add(PosTextSize.legacyDecSize(styles.height, styles.width)),
+          );
+        } else {
+          final height = styles.height == PosTextSize.size5 ? PosTextSize.size4 : styles.height;
+          final width = styles.width == PosTextSize.size5 ? PosTextSize.size4 : styles.width;
+          var decCmd = PosTextSize.decSize(height, width);
+          if (styles.bold) {
+            decCmd += 8;
+          }
+          bytes += Uint8List.fromList(
+            List.from(isKanji ? cSizeFSn.codeUnits : cSizeESCn.codeUnits)
+              ..add(isKanji
+                  ? PosTextSize.kanjiDecSize(height, width)
+                  : decCmd),
+          );
+        }
       _styles = _styles.copyWith(height: styles.height, width: styles.width);
     }
 
@@ -413,6 +427,7 @@ class Generator {
       bytes += styles.bold ? cBoldOn.codeUnits : cBoldOff.codeUnits;
       _styles = _styles.copyWith(bold: styles.bold);
     }
+
     if (styles.turn90 != _styles.turn90) {
       bytes += styles.turn90 ? cTurn90On.codeUnits : cTurn90Off.codeUnits;
       _styles = _styles.copyWith(turn90: styles.turn90);
@@ -486,14 +501,16 @@ class Generator {
       bool containsChinese = false,
       int? maxCharsPerLine,
       String? nonLatinEncoding,
-      bool isDotMatrix = false}) {
+      bool isDotMatrix = false,
+      bool legacySizing = false}) {
     List<int> bytes = List.empty(growable: true);
     if (!containsChinese) {
       bytes += _text(_encode(text, isKanji: containsChinese),
           styles: styles,
           isKanji: containsChinese,
           maxCharsPerLine: maxCharsPerLine,
-          isDotMatrix: isDotMatrix);
+          isDotMatrix: isDotMatrix,
+          legacySizing: legacySizing);
       // Ensure at least one line break after the text
       bytes += emptyLines(linesAfter + 1);
     } else {
@@ -501,7 +518,8 @@ class Generator {
           styles: styles,
           linesAfter: linesAfter,
           nonLatinEncoding: nonLatinEncoding,
-          isDotMatrix: isDotMatrix);
+          isDotMatrix: isDotMatrix,
+          legacySizing: legacySizing);
     }
     return bytes;
   }
@@ -871,7 +889,8 @@ class Generator {
       bool isKanji = false,
       int colWidth = 12,
       int? maxCharsPerLine,
-      bool isDotMatrix = false}) {
+      bool isDotMatrix = false,
+      bool legacySizing = false}) {
     List<int> bytes = List.empty(growable: true);
 
     if (!isDotMatrix && colInd != null) {
@@ -905,7 +924,7 @@ class Generator {
       );
     }
 
-    bytes += setStyles(styles, isKanji: isKanji, isDotMatrix: isDotMatrix);
+    bytes += setStyles(styles, isKanji: isKanji, isDotMatrix: isDotMatrix, legacySizing: legacySizing);
 
     bytes += textBytes;
     return bytes;
@@ -917,7 +936,8 @@ class Generator {
       int linesAfter = 0,
       int? maxCharsPerLine,
       String? nonLatinEncoding,
-      bool isDotMatrix = false}) {
+      bool isDotMatrix = false,
+      bool legacySizing = false}) {
     List<int> bytes = List.empty(growable: true);
     final list = _getLexemes(text, containsChinese: true);
     final List<String> lexemes = list[0];
@@ -933,7 +953,8 @@ class Generator {
           colInd: colInd,
           isKanji: isLexemeChinese[i],
           maxCharsPerLine: maxCharsPerLine,
-          isDotMatrix: isDotMatrix);
+          isDotMatrix: isDotMatrix,
+          legacySizing: legacySizing);
       // Define the absolute position only once (we print one line only)
       colInd = null;
     }

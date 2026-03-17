@@ -29,11 +29,33 @@ class PosTextSize {
   static const size7 = PosTextSize._internal(7);
   static const size8 = PosTextSize._internal(8);
 
+  static PosTextSize fromLegacySize(PosTextSize size) {
+    if (size == PosTextSize.size1) {
+      return PosTextSize.size1;
+    }
+    else if (size == PosTextSize.size2) {
+      return PosTextSize.size2;
+    }
+    else if (size == PosTextSize.size3) {
+      return PosTextSize.size4;
+    }
+    else if (size == PosTextSize.size4) {
+      return PosTextSize.size6;
+    }
+    else if (size == PosTextSize.size5) {
+      return PosTextSize.size8;
+    }
+    return PosTextSize.size1;
+  }
+
   static int decSize(PosTextSize height, PosTextSize width) =>
       16 * (width.value - 1) + (height.value - 1);
 
   static int kanjiDecSize(PosTextSize height, PosTextSize width) =>
       4 * (width.value - 1) + (height.value - 1);
+
+  static int legacyDecSize(PosTextSize height, PosTextSize width) =>
+      decSize(PosTextSize.fromLegacySize(height), PosTextSize.fromLegacySize(width));
 }
 
 class PaperSize {
