@@ -388,7 +388,45 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
       await Future.delayed(Duration(milliseconds: 200));
 
       _log('6. Successfully sent all ${bytes.length} print sections $extraLog', level: 'warn');
-      return PrinterConnectStatusResult(isSuccess: true);
+
+      // Post-send printer status verification
+      PrinterHwStatus hwStatus = PrinterHwStatus.unknown;
+      int? statusByte;
+      try {
+        if (socketConnection != null && model != null) {
+          String printerKey = '${model.ipAddress}:${model.port}';
+          final statusResult = await PrinterStatusChecker.queryStatus(
+            socketConnection!,
+            printerKey,
+            maxRetries: 1,
+            retryDelay: Duration(milliseconds: 100),
+          );
+          hwStatus = statusResult.status;
+          statusByte = statusResult.rawByte;
+
+          if (statusResult.responded) {
+            if (hwStatus == PrinterHwStatus.ready) {
+              _log('6.1. Post-send status: READY $extraLog', level: 'info');
+            } else {
+              _log(
+                '6.1. Post-send status: ${hwStatus.name} (raw: 0x${statusByte?.toRadixString(16) ?? 'null'}) $extraLog',
+                level: 'error',
+              );
+            }
+          } else {
+            _log('6.1. Post-send status: printer did not respond to status query $extraLog', level: 'warn');
+          }
+        }
+      } catch (e) {
+        _log('6.1. Post-send status check failed (non-fatal): $e $extraLog', level: 'warn');
+        // Non-fatal — data was already sent successfully
+      }
+
+      return PrinterConnectStatusResult(
+        isSuccess: true,
+        printerStatus: hwStatus,
+        statusByte: statusByte,
+      );
     } catch (e, stackTrace) {
       _log('7. Failed to splitSend print job $extraLog: $e', level: 'error', error: e, stackTrace: stackTrace);
 

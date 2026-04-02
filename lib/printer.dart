@@ -12,15 +12,28 @@ enum USBStatus { none, connecting, connected }
 
 enum TCPStatus { none, connected }
 
+enum PrinterHwStatus {
+  unknown, // No status check performed or printer didn't respond to status query
+  ready, // Printer responded and is ready
+  paperOut, // Printer reports paper out
+  coverOpen, // Printer reports cover open
+  error, // Printer reports an error condition
+  notResponding, // Status query sent but no response within timeout
+}
+
 class PrinterConnectStatusResult {
   final bool isSuccess;
   final Object? exception;
   final StackTrace? stackTrace;
+  final PrinterHwStatus printerStatus;
+  final int? statusByte; // Raw status byte from printer for debugging
 
   const PrinterConnectStatusResult({
     required this.isSuccess,
     this.exception,
     this.stackTrace,
+    this.printerStatus = PrinterHwStatus.unknown,
+    this.statusByte,
   });
 }
 
