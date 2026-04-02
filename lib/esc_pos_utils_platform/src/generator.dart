@@ -7,7 +7,7 @@
  */
 
 import 'dart:convert';
-import 'package:enough_convert/enough_convert.dart' show gbk;
+import 'package:enough_convert/enough_convert.dart' show big5, gbk;
 import 'package:flutter/services.dart';
 import 'package:flutter_pos_printer_platform/src/ext.dart';
 import 'package:image/image.dart' as img;
@@ -88,7 +88,11 @@ class Generator {
       late List<int> encodedText;
       if (nonLatinEncoding == "GBK") {
         encodedText = gbk.encode(text);
-      } else {
+      }
+      else if (nonLatinEncoding == "BIG-5") {
+        encodedText = big5.encode(text);
+      }
+      else {
         encodedText = utf8.encode(text);
       }
       return Uint8List.fromList(encodedText);
