@@ -567,10 +567,14 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
       _log('${printerIp ?? ''}Socket closed successfully', level: 'debug');
     } catch (e, s) {
       // close() failed or timed out — destroy() below handles actual cleanup
-      _log('${printerIp ?? ''}Socket close failed: $e', level: 'warn', error: e, stackTrace: s);
+      _log('${printerIp ?? ''}Socket close failed - cleanup handled by destroy(). Err: $e', level: 'warn', error: e, stackTrace: s);
     } finally {
       // Unconditional — the only guaranteed cleanup for OS-level socket resources
-      try { socketToClose.destroy(); } catch (_) {}
+      try {
+        socketToClose.destroy();
+      } catch (_) {
+        // destroy() should never throw, but if it does, we silence it here so it won't suppress the error above
+      }
     }
   }
 
