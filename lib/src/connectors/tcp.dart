@@ -549,52 +549,28 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
 
   Future<void> _safeCloseSocket({String? printerIp}) async {
     final socketToClose = printerIp != null ? socketsPerIp[printerIp] : this._socket;
-    if (socketToClose != null) {
-      try {
-        // Set a shorter timeout for closing operations
-        bool socketClosed = false;
+    if (socketToClose == null) {
+      return;
+    }
 
-        // Try the gentle approach first
-        try {
-          await socketToClose.flush().timeout(Duration(milliseconds: 500), onTimeout: () {
-            _log('${printerIp != null ? '$printerIp ' : ''}Socket flush timed out, proceeding to close', level: 'warn');
-            return null;
-          });
+    // Nullify reference immediately so no other call touches this socket
+    if (printerIp != null) {
+      socketsPerIp.remove(printerIp);
+    } else {
+      _socket = null;
+    }
 
-          await socketToClose.close().timeout(Duration(milliseconds: 500), onTimeout: () {
-            _log('${printerIp != null ? '$printerIp ' : ''}Socket close timed out, will destroy socket', level: 'warn');
-            return null;
-          });
-
-          socketClosed = true;
-        } catch (e, s) {
-          _log('${printerIp != null ? '$printerIp ' : ''}Error during socket close: $e',
-              level: 'error', error: e, stackTrace: s);
-        }
-
-        // Always destroy the socket even if close fails
-        socketToClose.destroy();
-        if (printerIp != null) {
-          socketsPerIp.remove(printerIp);
-        } else {
-          _socket = null;
-        }
-
-        if (socketClosed) {
-          _log('${printerIp != null ? '$printerIp ' : ''}Socket closed successfully', level: 'debug');
-        } else {
-          _log('${printerIp != null ? '$printerIp ' : ''}Socket was destroyed after close failure', level: 'warn');
-        }
-      } catch (e) {
-        _log('${printerIp != null ? '$printerIp ' : ''}Error during socket cleanup: $e', level: 'error', error: e);
-
-        // Last resort - null out the socket
-        if (printerIp != null) {
-          socketsPerIp.remove(printerIp);
-        } else {
-          _socket = null;
-        }
-      }
+    try {
+      // Skip flush — this is always a teardown path.
+      // flush() on a dangling sink throws Bad state; there's no data worth saving.
+      await socketToClose.close().timeout(Duration(milliseconds: 500));
+      _log('${printerIp ?? ''}Socket closed successfully', level: 'debug');
+    } catch (e, s) {
+      // close() failed or timed out — destroy() below handles actual cleanup
+      _log('${printerIp ?? ''}Socket close failed: $e', level: 'warn', error: e, stackTrace: s);
+    } finally {
+      // Unconditional — the only guaranteed cleanup for OS-level socket resources
+      try { socketToClose.destroy(); } catch (_) {}
     }
   }
 
