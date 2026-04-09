@@ -332,7 +332,7 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
             } catch (e, s) {
               if (e.toString().contains('StreamSink is closed')) {
                 if (model != null) {
-                  _log('splitSend try to reconnect after StreamSink is closed i:$i $extraLog', level: 'warn', error: e, stackTrace: s);
+                  _log('splitSend try to reconnect due to closed StreamSink i:$i $extraLog', level: 'warn', error: e, stackTrace: s);
                   final PrinterConnectStatusResult result =
                       useDedicatedSocket ? await connectDedicatedSocket(model) : await connect(model);
                   if (result.isSuccess) {
@@ -358,10 +358,23 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
             }
 
             _log('4. Sent print chunk ${i + 1}/${bytes.length}, chunk size: ${bytes[i].length} bytes $extraLog', level: 'info');
-
-            await validSocket.flush().timeout(flushTimeout, onTimeout: () {
-              throw TimeoutException('Flush operation timed out - printer may be busy');
-            });
+            try {
+              await validSocket.flush().timeout(flushTimeout);
+            } on TimeoutException {
+              // flush() waits for the printer to acknowledge all pending data via TCP ACKs.
+              // If the printer is unresponsive or the connection dropped, ACKs never arrive
+              // and flush() hangs until timeout. The socket's sink is now in a dangling
+              // async state and cannot be reused — destroy immediately.
+              _log('Flush timed out, destroying socket immediately', level: 'warn');
+              validSocket.destroy();
+              if (useDedicatedSocket) {
+                socketsPerIp.remove(model?.ipAddress);
+              } else {
+                _socket = null;
+              }
+              // Now rethrow or throw a clean exception for the outer catch
+              throw TimeoutException('Flush timed out - printer may be busy');
+            }
             await Future.delayed(Duration(milliseconds: 20));
           }
         } else {
@@ -372,7 +385,7 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
           } catch (e, s) {
             if (e.toString().contains('StreamSink is closed')) {
               if (model != null) {
-                _log('Split send try to reconnect after StreamSink is closed i:$i $extraLog', level: 'warn', error: e, stackTrace: s);
+                _log('Split send try to reconnect due to closed StreamSink i:$i $extraLog', level: 'warn', error: e, stackTrace: s);
                 final PrinterConnectStatusResult result =
                     useDedicatedSocket ? await connectDedicatedSocket(model) : await connect(model);
                 if (result.isSuccess) {
@@ -399,11 +412,24 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
 
           _log('5. Sent small section print ${i + 1}/${bytes.length}, section size: ${bytes[i].length} bytes $extraLog',
               level: 'info');
-
           // Flush more frequently: always flush after each section
-          await validSocket.flush().timeout(flushTimeout, onTimeout: () {
-            throw TimeoutException('Flush operation timed out - printer may be busy');
-          });
+          try {
+            await validSocket.flush().timeout(flushTimeout);
+          } on TimeoutException {
+            // flush() waits for the printer to acknowledge all pending data via TCP ACKs.
+            // If the printer is unresponsive or the connection dropped, ACKs never arrive
+            // and flush() hangs until timeout. The socket's sink is now in a dangling
+            // async state and cannot be reused — destroy immediately.
+            _log('Flush timed out, destroying socket immediately', level: 'warn');
+            validSocket.destroy();
+            if (useDedicatedSocket) {
+              socketsPerIp.remove(model?.ipAddress);
+            } else {
+              _socket = null;
+            }
+            // Now rethrow or throw a clean exception for the outer catch
+            throw TimeoutException('Flush timed out - printer may be busy');
+          }
         }
 
         // Add delay between sections
