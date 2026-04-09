@@ -326,49 +326,82 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
           // Break large sections into chunks of 4KB
           final chunks = _splitIntoChunks(section, 4096);
           for (final chunk in chunks) {
+            var flushTimeout = Duration(seconds: 5);
             try {
               validSocket.add(Uint8List.fromList(chunk));
             } catch (e, s) {
               if (e.toString().contains('StreamSink is closed')) {
                 if (model != null) {
-                  _log('Split send try to reconnect after StreamSink is closed i:$i $extraLog', level: 'error', error: e, stackTrace: s);
-                  useDedicatedSocket ? await connectDedicatedSocket(model) : await connect(model);
+                  _log('splitSend try to reconnect after StreamSink is closed i:$i $extraLog', level: 'warn', error: e, stackTrace: s);
+                  final PrinterConnectStatusResult result =
+                      useDedicatedSocket ? await connectDedicatedSocket(model) : await connect(model);
+                  if (result.isSuccess) {
+                    socketConnection = useDedicatedSocket ? socketsPerIp[model.ipAddress] : _socket;
+                    if (socketConnection == null) {
+                      throw SocketException('Socket is null');
+                    }
+                    _log('reconnect out of closed StreamSink success', level: 'warn');
+                    // Give the printer time to accept the new connection
+                    await Future.delayed(Duration(milliseconds: 300));
+                    // Use longer timeout following a reconnect
+                    flushTimeout = Duration(seconds: 8);
+                    // Socket supposed to be ready to add & send/flush data
+                    validSocket = socketConnection;
+                    validSocket.add(Uint8List.fromList(chunk));
+                  } else {
+                    _log('reconnect out of closed StreamSink failed', level: 'error');
+                  }
+                } else {
+                  _log('model = null. splitSend try to reconnect after StreamSink is closed i:$i $extraLog', level: 'error', error: e, stackTrace: s);
                 }
-                socketConnection = useDedicatedSocket ? socketsPerIp[model?.ipAddress] : _socket;
-                if (socketConnection == null) throw SocketException('Socket is null');
-                validSocket = socketConnection;
-                validSocket.add(Uint8List.fromList(chunk));
               }
             }
 
             _log('4. Sent print chunk ${i + 1}/${bytes.length}, chunk size: ${bytes[i].length} bytes $extraLog', level: 'info');
 
-            await validSocket.flush().timeout(Duration(seconds: 5), onTimeout: () {
+            await validSocket.flush().timeout(flushTimeout, onTimeout: () {
               throw TimeoutException('Flush operation timed out - printer may be busy');
             });
             await Future.delayed(Duration(milliseconds: 20));
           }
         } else {
           // Small enough section to send at once
+          var flushTimeout = Duration(seconds: 5);
           try {
             validSocket.add(Uint8List.fromList(section));
           } catch (e, s) {
             if (e.toString().contains('StreamSink is closed')) {
               if (model != null) {
-                _log('Split send try to reconnect after StreamSink is closed i:$i $extraLog', level: 'error', error: e, stackTrace: s);
-                useDedicatedSocket ? await connectDedicatedSocket(model) : await connect(model);
+                _log('Split send try to reconnect after StreamSink is closed i:$i $extraLog', level: 'warn', error: e, stackTrace: s);
+                final PrinterConnectStatusResult result =
+                    useDedicatedSocket ? await connectDedicatedSocket(model) : await connect(model);
+                if (result.isSuccess) {
+                  socketConnection = useDedicatedSocket ? socketsPerIp[model.ipAddress] : _socket;
+                  if (socketConnection == null) {
+                    throw SocketException('Socket is null');
+                  }
+                  _log('reconnect out of closed StreamSink success', level: 'warn');
+                  // Give the printer time to accept the new connection
+                  await Future.delayed(Duration(milliseconds: 300));
+                  // Use longer timeout following a reconnect
+                  flushTimeout = Duration(seconds: 8);
+                  // Socket supposed to be ready to add & send/flush data
+                  validSocket = socketConnection;
+                  validSocket.add(Uint8List.fromList(section));
+                } else {
+                  _log('reconnect out of closed StreamSink failed', level: 'error');
+                }
+              } else {
+                _log('model = null. splitSend try to reconnect after StreamSink is closed i:$i $extraLog', level: 'error', error: e, stackTrace: s);
               }
-              socketConnection = useDedicatedSocket ? socketsPerIp[model?.ipAddress] : _socket;
-              if (socketConnection == null) throw SocketException('Socket is null');
-              validSocket = socketConnection;
-              validSocket.add(Uint8List.fromList(section));
             }
           }
+
           _log('5. Sent small section print ${i + 1}/${bytes.length}, section size: ${bytes[i].length} bytes $extraLog',
               level: 'info');
 
           // Flush more frequently: always flush after each section
-          await validSocket.flush().timeout(Duration(seconds: 3), onTimeout: () {
+          await validSocket.flush().timeout(flushTimeout, onTimeout: () {
             throw TimeoutException('Flush operation timed out - printer may be busy');
           });
         }
