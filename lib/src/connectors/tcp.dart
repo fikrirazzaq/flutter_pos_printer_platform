@@ -595,8 +595,9 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
   @override
   Future<PrinterConnectStatusResult> connectDedicatedSocket(TcpPrinterInput model) async {
     // Clear any existing socket first
-    await _safeCloseSocket(printerIp: model.ipAddress);
+    // await _safeCloseSocket(printerIp: model.ipAddress);
 
+    // Cooldown check first (no socket close needed yet)
     String printerKey = '${model.ipAddress}:${model.port}';
     // Check if recently had a connection error and need to cool down
     if (_lastConnectionAttempts.containsKey(printerKey)) {
