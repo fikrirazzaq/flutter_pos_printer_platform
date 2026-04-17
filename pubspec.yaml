@@ -6,7 +6,7 @@ homepage: https://github.com/arthas1888/flutter_pos_printer_platform
 publish_to: 'none'
 
 environment:
-  sdk: '>=3.10.0 <4.0.0'
+  sdk: '>=3.6.0 <4.0.0'
 
 dependencies:
   flutter:
