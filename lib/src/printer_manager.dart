@@ -179,10 +179,10 @@ class PrinterManager {
     } else if (type == PrinterType.usb && (Platform.isAndroid || Platform.isWindows)) {
       return await usbPrinterConnector.disconnect(delayMs: delayMs);
     } else {
-      if (dedicatedSocketIp != null && tcpPrinterConnector.socketsPerIp.containsKey(dedicatedSocketIp!)) {
-        return await tcpPrinterConnector.disconnectDedicatedSocket(printerIp: dedicatedSocketIp);
+      if (dedicatedSocketIp != null) {
+        return await tcpPrinterConnector.disconnectDedicatedSocket(printerIp: dedicatedSocketIp, delayMs: delayMs);
       } else {
-        return await tcpPrinterConnector.disconnect();
+        return await tcpPrinterConnector.disconnect(delayMs: delayMs);
       }
     }
   }
@@ -220,8 +220,16 @@ class PrinterManager {
     } else if (type == PrinterType.usb && (Platform.isAndroid || Platform.isWindows)) {
       return await usbPrinterConnector.splitSend(bytes);
     } else {
-      return await tcpPrinterConnector.splitSend(bytes,
-          model: model as TcpPrinterInput?, delayBetweenMs: delayBetweenMs, useDedicatedSocket: useDedicatedSocket);
+      // Route to splitSendV2 for any receipt that explicitly declares TcpPrinterInput.isImageReceipt.
+      // Non-kitchen receipts don't set isImageReceipt — they use the legacy path until migrated. This is an intentional staged rollout.
+      final tcpModel = model as TcpPrinterInput?;
+      if (tcpModel?.isImageReceipt != null) {
+        return await tcpPrinterConnector.splitSendV2(bytes,
+            model: tcpModel, delayBetweenMs: delayBetweenMs, useDedicatedSocket: useDedicatedSocket);
+      } else {
+        return await tcpPrinterConnector.splitSend(bytes,
+            model: tcpModel, delayBetweenMs: delayBetweenMs, useDedicatedSocket: useDedicatedSocket);
+      }
     }
   }
 
@@ -232,9 +240,11 @@ class PrinterManager {
       return await usbPrinterConnector.disconnect(delayMs: delayMs);
     } else {
       bool disconnected = false;
-      disconnected = await tcpPrinterConnector.disconnect();
-      for (final ip in tcpPrinterConnector.socketsPerIp.keys) {
-        disconnected = await tcpPrinterConnector.disconnectDedicatedSocket(printerIp: ip);
+      if (useDedicatedSocket) {
+        await tcpPrinterConnector.disposeAllDedicatedSockets(delayMs: delayMs);
+        disconnected = true;
+      } else {
+        disconnected = await tcpPrinterConnector.disconnect(delayMs: delayMs);
       }
       return disconnected;
     }
