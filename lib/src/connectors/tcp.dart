@@ -567,7 +567,7 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
 
       if (preSendQueryStatus) {
         final PrinterQueryResult status =
-            await PrinterStatusChecker.queryPrinterStatus(socket, '${model.ipAddress}:${model.port}');
+            await PrinterStatusChecker.queryPrinterStatus(socket, '${model.ipAddress}:${model.port}', cacheTtl: 5);
         if (status.hwCondition != PrinterHwStatus.ready) {
           return PrinterConnectStatusResult(
             isSuccess: false,
