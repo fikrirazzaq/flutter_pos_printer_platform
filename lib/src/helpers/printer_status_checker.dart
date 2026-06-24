@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
+
 import '../../printer.dart';
 
 class PrinterStatusResult {
@@ -22,11 +24,19 @@ class PrinterStatusResult {
 }
 
 class PrinterStatusChecker {
-  // DLE EOT commands — most widely supported for real-time status
+  // DLE EOT commands — most widely supported for real-time status. Printer responds immediately
   static const List<int> dleEot1 = [0x10, 0x04, 0x01]; // Printer status
   static const List<int> dleEot2 = [0x10, 0x04, 0x02]; // Offline cause status
   static const List<int> dleEot3 = [0x10, 0x04, 0x03]; // Error cause status
   static const List<int> dleEot4 = [0x10, 0x04, 0x04]; // Paper roll sensor status
+
+  // GS r n — paper sensor status (buffered, may lag behind buffer)
+  // Useful as fallback for printers that don't support DLE EOT
+  static const List<int> gsR1   = [0x1D, 0x72, 0x01]; // Paper sensor status (n=1)
+  static const List<int> gsR49  = [0x1D, 0x72, 0x31]; // Paper sensor status (n=49)
+
+  // paper sensor, older Epson (TM-T70, TM-U220)
+  static const List<int> escV = [0x1B, 0x76];
 
   static const List<List<int>> statusCommands = [
     dleEot1, // DLE EOT 1 - Printer status (most common)
@@ -200,5 +210,289 @@ class PrinterStatusChecker {
 
     // For non-DLE-EOT commands, any response means printer is alive
     return PrinterHwStatus.ready;
+  }
+
+  static final Map<String, PrinterQueryResult> _queryResultCache = {};
+  static const List<PrinterStatusCommand> _probeCommands = [
+    PrinterStatusCommand(
+      bytes: PrinterStatusChecker.dleEot4,
+      statusType: PrinterStatusType.paper,
+      priority: 1,
+      canBlockPrint: true,
+    ),
+    PrinterStatusCommand(
+      bytes: gsR1, // GS r 1: paper sensor (buffered fallback)
+      statusType: PrinterStatusType.paper,
+      priority: 2,
+      canBlockPrint: true,
+    ),
+    PrinterStatusCommand(
+      bytes: gsR49, // GS r 49: some Star/Generic models use n=49
+      statusType: PrinterStatusType.paper,
+      priority: 3,
+      canBlockPrint: true,
+    ),
+    PrinterStatusCommand(
+      bytes: escV,
+      statusType: PrinterStatusType.paper,
+      priority: 4,
+      canBlockPrint: true,
+    ),
+    PrinterStatusCommand(
+      bytes: PrinterStatusChecker.dleEot2,
+      statusType: PrinterStatusType.cover,
+      priority: 1,
+      canBlockPrint: true,
+    ),
+    PrinterStatusCommand(
+      bytes: PrinterStatusChecker.dleEot3,
+      statusType: PrinterStatusType.error,
+      priority: 1,
+      canBlockPrint: true,
+    ),
+  ];
+
+  static Future<PrinterQueryResult> queryPrinterStatus(Socket socket, String printerKey) async {
+    final cached = _queryResultCache[printerKey];
+
+    if (cached != null) {
+      final cacheTtl = 3;
+      if (DateTime.now().difference(cached.lastQueried!) < Duration(seconds: cacheTtl)) {
+        debugPrint('${printerKey} (queryPrinterStatus) skipped. use recent cache ${cached.toString()}');
+        return cached;
+      } else {
+        debugPrint('${printerKey} (queryPrinterStatus) _queryUsingProfile ${DateTime.now()} ${cached.toString()}');
+        return await _queryUsingProfile(socket, printerKey, cached);
+      }
+    }
+
+    return await _probeAndBuildProfile(socket, printerKey);
+  }
+
+  static Future<PrinterQueryResult> _probeAndBuildProfile(Socket socket, String printerKey) async {
+    final profile = PrinterQueryResult();
+
+    for (final statusType in PrinterStatusType.values) {
+      final candidates = _probeCommands
+          .where((c) => c.statusType == statusType)
+          .toList()
+        ..sort((a, b) => a.priority.compareTo(b.priority));
+      for (final command in candidates) {
+        debugPrint('${printerKey} (queryPrinterStatus) _probeAndBuildProfile -> _getStatusResponse ${statusType.name} ${command.priority} ${command.bytes.toHex()}..');
+        final response = await _getStatusResponse(socket, command.bytes);
+        if (response != null) {
+          // This command works for this printer — cache it
+          final status = _decodeStatusResponse(command, response);
+          debugPrint('${printerKey} (queryPrinterStatus) _probeAndBuildProfile -> _getStatusResponse ${statusType.name} ${command.priority} ${command.bytes.toHex()}.. RESPONDED $response/${status.name}');
+          switch (command.statusType) {
+            case PrinterStatusType.paper:
+              profile.paperCommand = command;
+              profile.paperStatus = status;
+              break;
+            case PrinterStatusType.cover:
+              profile.coverCommand = command;
+              profile.coverStatus = status;
+              break;
+            case PrinterStatusType.error:
+              profile.errorCommand = command;
+              profile.errorStatus = status;
+              break;
+          }
+          // break `candidates` loop after working command for x status identified
+          break;
+        }
+      }
+    }
+
+    profile.lastQueried = DateTime.now();
+    _queryResultCache.putIfAbsent(printerKey, () => profile);
+    return profile;
+  }
+
+  static Future<PrinterQueryResult> _queryUsingProfile(
+      Socket socket, String printerKey, PrinterQueryResult profile) async {
+    /// Priority order — paper out is the most immediately obvious failure,
+    /// cover open typically also causes paper out so catching it second avoids redundancy,
+    /// error last since it's a catch-all.
+    // Paper Check
+    if (profile.paperCommand != null) {
+      debugPrint('${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse paper ${profile.paperCommand!.priority} ${profile.paperCommand!.bytes.toHex()}..');
+      final response = await _getStatusResponse(socket, profile.paperCommand!.bytes);
+      if (response != null) {
+        profile.paperStatus = _decodeStatusResponse(profile.paperCommand!, response);
+        debugPrint('${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse paper ${profile.paperCommand!.priority} ${profile.paperCommand!.bytes.toHex()}.. RESPONDED $response/${profile.paperStatus.name}');
+      } else {
+        // Previous command not working anymore
+        profile.paperCommand = null;
+        profile.paperStatus = PrinterHwStatus.ready;
+      }
+    }
+
+    // Cover Check
+    if (profile.coverCommand != null && profile.isPaperNormal) {
+      debugPrint('${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse cover ${profile.coverCommand!.priority} ${profile.coverCommand!.bytes.toHex()}..');
+      final response = await _getStatusResponse(socket, profile.coverCommand!.bytes);
+      if (response != null) {
+        profile.coverStatus = _decodeStatusResponse(profile.coverCommand!, response);
+        debugPrint('${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse cover ${profile.coverCommand!.priority} ${profile.coverCommand!.bytes.toHex()}.. RESPONDED ${response}/${profile.coverStatus.name}');
+      } else {
+        // Previous command not working anymore
+        profile.coverCommand = null;
+        profile.coverStatus = PrinterHwStatus.ready;
+      }
+    }
+
+    // Error Check
+    if (profile.errorCommand != null && (profile.isPaperNormal && profile.isCoverNormal)) {
+      debugPrint('${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse errorstate ${profile.errorCommand!.priority} ${profile.errorCommand!.bytes.toHex()}..');
+      final response = await _getStatusResponse(socket, profile.errorCommand!.bytes);
+      if (response != null) {
+        profile.errorStatus = _decodeStatusResponse(profile.errorCommand!, response);
+        debugPrint('${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse errorstate ${profile.errorCommand!.priority} ${profile.errorCommand!.bytes.toHex()}.. RESPONDED ${response}/${profile.errorStatus.name}');
+      } else {
+        // Previous command not working anymore
+        profile.errorCommand = null;
+        profile.errorStatus = PrinterHwStatus.ready;
+      }
+    }
+
+    profile.lastQueried = DateTime.now();
+    _queryResultCache[printerKey] = profile;
+
+    return profile;
+  }
+
+  static Future<int?> _getStatusResponse(Socket socket, List<int> command) async {
+    final completer = Completer<int?>();
+    StreamSubscription? sub;
+    Timer? timeout;
+
+    void stopListeningResponse([int? response]) {
+      if (!completer.isCompleted) {
+        completer.complete(response);
+      }
+      sub?.cancel();
+      timeout?.cancel();
+    }
+
+    try {
+      sub = socket.listen(
+        (data) {
+          if (data.isEmpty) return;
+          debugPrint('(queryPrinterStatus) CMD: ${command} | RESPONSE: $data');
+          stopListeningResponse(data.first);
+        },
+        onError: (_) => stopListeningResponse(),
+        onDone: () => stopListeningResponse(),
+        cancelOnError: true,
+      );
+      timeout = Timer(const Duration(milliseconds: 300), () => stopListeningResponse());
+      socket.add(command);
+      await socket.flush();
+    } catch (_) {
+      stopListeningResponse();
+    }
+
+    return completer.future;
+  }
+
+  static PrinterHwStatus _decodeStatusResponse(PrinterStatusCommand command, int response) {
+    switch (command.statusType) {
+      case PrinterStatusType.paper:
+        if (listEquals(command.bytes, dleEot4)) {
+          // Bits 5,6: paper end sensor — On = paper not present
+          if ((response & 0x60) != 0) return PrinterHwStatus.paperOut;
+          return PrinterHwStatus.ready;
+        }
+        if (listEquals(command.bytes, gsR1) || listEquals(command.bytes, gsR49)) {
+          // Bits 2,3: paper roll near-end sensor (On = near end, not fully out)
+          // True paper-out takes the printer offline; treat near-end as a warning
+          if ((response & 0x0C) != 0) return PrinterHwStatus.paperOut;
+          return PrinterHwStatus.ready;
+        }
+        if (listEquals(command.bytes, escV)) {
+          // Bit 2 On (0x04) → paper end (hard out)
+          // Bit 0 On (0x01) → paper near end — treat as warning, not full block
+          if ((response & 0x04) != 0) return PrinterHwStatus.paperOut;
+          if ((response & 0x01) != 0) return PrinterHwStatus.paperOut;
+          return PrinterHwStatus.ready;
+        }
+        return PrinterHwStatus.unknown;
+
+      case PrinterStatusType.cover:
+        if (listEquals(command.bytes, dleEot2)) {
+          if ((response & 0x04) != 0) return PrinterHwStatus.coverOpen;
+          return PrinterHwStatus.ready;
+        }
+        return PrinterHwStatus.unknown;
+
+      case PrinterStatusType.error:
+        if (listEquals(command.bytes, dleEot3)) {
+          // Unrecoverable or auto-cutter errors are blocking
+          if ((response & 0x20) != 0) return PrinterHwStatus.error; // unrecoverable
+          if ((response & 0x08) != 0) return PrinterHwStatus.error; // auto-cutter
+          if ((response & 0x40) != 0) return PrinterHwStatus.error; // auto-recoverable
+          return PrinterHwStatus.ready;
+        }
+        return PrinterHwStatus.unknown;
+    }
+  }
+}
+
+enum PrinterStatusType { paper, cover, error }
+
+class PrinterStatusCommand {
+  final PrinterStatusType statusType;
+  final List<int> bytes;
+  final int priority;
+  final bool canBlockPrint;
+
+  const PrinterStatusCommand({required this.statusType, required this.bytes, required this.priority, required this.canBlockPrint});
+}
+
+class PrinterQueryResult {
+  PrinterStatusCommand? paperCommand;
+  PrinterHwStatus paperStatus;
+  PrinterStatusCommand? coverCommand;
+  PrinterHwStatus coverStatus;
+  PrinterStatusCommand? errorCommand;
+  PrinterHwStatus errorStatus;
+
+  /// Timestamp of last successful query — used for TTL check
+  DateTime? lastQueried;
+
+  PrinterQueryResult({
+    this.paperCommand,
+    this.paperStatus = PrinterHwStatus.unknown,
+    this.coverCommand,
+    this.coverStatus = PrinterHwStatus.unknown,
+    this.errorCommand,
+    this.errorStatus = PrinterHwStatus.unknown,
+    this.lastQueried,
+  });
+
+  PrinterHwStatus get hwCondition {
+    /// Priority order — paper out is the most immediately obvious failure,
+    /// cover open typically also causes paper out so catching it second avoids redundancy,
+    /// error last since it's a catch-all.
+    if (paperStatus == PrinterHwStatus.paperOut) return paperStatus;
+    if (coverStatus == PrinterHwStatus.coverOpen) return coverStatus;
+    if (errorStatus == PrinterHwStatus.error) return errorStatus;
+    // Assume printer in ready condition
+    return PrinterHwStatus.ready;
+  }
+
+  bool get isPaperNormal => paperStatus != PrinterHwStatus.paperOut;
+  bool get isCoverNormal => coverStatus != PrinterHwStatus.coverOpen;
+  bool get isStateNormal => errorStatus != PrinterHwStatus.error;
+
+  @override
+  String toString() =>
+      'PrinterQueryResult(paper=${paperStatus.name}, cover=${coverStatus.name}, error=${errorStatus.name}, lastQueried=${lastQueried})';
+}
+
+extension on List<int> {
+  String toHex() {
+    return map((b) => '\\x${b.toRadixString(16).padLeft(2, '0')}').join('');
   }
 }

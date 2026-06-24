@@ -530,7 +530,8 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
   Future<PrinterConnectStatusResult> splitSendV2(List<List<int>> bytes, {
     TcpPrinterInput? model,
     int delayBetweenMs = 50,
-    bool useDedicatedSocket = false
+    bool useDedicatedSocket = false,
+    bool preSendQueryStatus = false,
   }) async {
     if (model == null) {
       return PrinterConnectStatusResult(isSuccess: false, exception: 'TCP model is null');
@@ -562,6 +563,17 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         // Socket dead before we even started — reconnect now before sending anything
         _log('$ip socket dead before send (setOption failed) — reconnecting', level: 'warn');
         socket = await _reconnectSocket(model, useDedicatedSocket);
+      }
+
+      if (preSendQueryStatus) {
+        final PrinterQueryResult status =
+            await PrinterStatusChecker.queryPrinterStatus(socket, '${model.ipAddress}:${model.port}');
+        if (status.hwCondition != PrinterHwStatus.ready) {
+          return PrinterConnectStatusResult(
+            isSuccess: false,
+            printerStatus: status.hwCondition,
+          );
+        }
       }
 
       // Calculate adaptive delays based on data size

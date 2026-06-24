@@ -210,11 +210,12 @@ class PrinterManager {
     }
   }
 
-  Future<PrinterConnectStatusResult> splitSend(
-      {required PrinterType type,
-      required List<List<int>> bytes,
-      BasePrinterInput? model,
-      int delayBetweenMs = 50}) async {
+  Future<PrinterConnectStatusResult> splitSend({required PrinterType type,
+    required List<List<int>> bytes,
+    BasePrinterInput? model,
+    int delayBetweenMs = 50,
+    bool preSendQueryStatus = false,
+  }) async {
     if (type == PrinterType.bluetooth && (Platform.isIOS || Platform.isAndroid)) {
       return await bluetoothPrinterConnector.splitSend(bytes);
     } else if (type == PrinterType.usb && (Platform.isAndroid || Platform.isWindows)) {
@@ -225,7 +226,10 @@ class PrinterManager {
       final tcpModel = model as TcpPrinterInput?;
       if (tcpModel?.isImageReceipt != null) {
         return await tcpPrinterConnector.splitSendV2(bytes,
-            model: tcpModel, delayBetweenMs: delayBetweenMs, useDedicatedSocket: useDedicatedSocket);
+          model: tcpModel,
+          delayBetweenMs: delayBetweenMs,
+          useDedicatedSocket: useDedicatedSocket,
+          preSendQueryStatus: preSendQueryStatus,);
       } else {
         return await tcpPrinterConnector.splitSend(bytes,
             model: tcpModel, delayBetweenMs: delayBetweenMs, useDedicatedSocket: useDedicatedSocket);
