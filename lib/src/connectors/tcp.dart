@@ -601,20 +601,21 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
                 sectionData: sectionData,
                 sectionIndex: i,
               );
-              // no exception when sending data, exit from while scope
+              // no issue on first attempt, exit from while scope
               break sendAttempt;
             } on _SocketReconnectedException catch (e) {
-              // socket was reconnected & replaced mid-send, retry with new socketConnection
+              // socket is reconnected & replaced mid-send, retry with new socketConnection
               socket = e.newSocket;
               // Short pause to let printer settle after new connection
               await Future.delayed(const Duration(milliseconds: 300));
-              attempt++;
-              if (((model.isImageReceipt ?? false) && i > 0) || attempt > maxSendAttempts) {
-                // if image receipt and reconnect on mid-send (section > 0), treat as a full failure
-                // if still failed on 2nd attempt, after first reconnect attempt, regardless section
-                // handle by outer catch
+              if ((attempt + 1) == maxSendAttempts || ((model.isImageReceipt ?? false) && i > 0)) {
+                // If 2nd attempt still failed, let outer catch handle
+                // if is image receipt (image stripe content split) & failure occurs mid section,
+                // treat as a full failure to trigger fresh retry
                 rethrow;
               } else {
+                // trigger next send attempt
+                attempt++;
                 _log('$ip${useDedicatedSocket ? '' : ' (shared)'} socket replaced when sending section:$i, retry send #$attempt', level: 'warn');
               }
             } catch (e, s) {
@@ -627,16 +628,20 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
             '3. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Sent section:$i, ${sectionData.isEmpty ? 'drain gap' : '${sectionData.length} bytes'}',
             level: 'info');
         if (i < bytes.length - 1) {
-          // Use adaptive delay based on section size
           int currentDelay = adaptiveDelay;
-          if (sectionData.isEmpty) {
-            // Empty drain sentinel before cut — use full adaptive delay
-            currentDelay = adaptiveDelay;
-          } else if (sectionData.length <= 4) {
-            // Likely reset section, or pre-cut-delay on image printing
+          if (i == 0) {
+            // 1st section is printer reset command, use base value
             currentDelay = delayBetweenMs;
-          } else if (sectionData.length > 4096) {
-            currentDelay += 20; // Additional delay for larger sections
+          } else if (i - 1 == bytes.length - 1 && sectionData.isEmpty) {
+            // This likely to applies on empty section before "cut" command
+            // To avoid premature cut (especially on fast speed printer),
+            // treat empty section as an extra wait for previous data to print completely
+            currentDelay = adaptiveDelay;
+          } else {
+            // Likely applies to content section
+            if (sectionData.length > 4096) {
+              currentDelay += 20; // Additional delay for larger sections
+            }
           }
           _log(
               '3.1. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Sent section:$i ${sectionData.length} bytes, delay $currentDelay',
@@ -650,8 +655,6 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
 
       _log('4. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Successfully sent all ${bytes.length} print sections',
           level: 'warn');
-
-      // TODO post-send printer check, apply later
 
       return PrinterConnectStatusResult(
         isSuccess: true,
