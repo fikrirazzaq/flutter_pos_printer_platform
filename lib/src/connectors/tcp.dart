@@ -590,7 +590,7 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
           sendAttempt:
           while (attempt <= maxSendAttempts) {
             try {
-              await _sendChunk(
+              await _sendDataSection(
                 socket: socket!,
                 model: model,
                 useDedicatedSocket: useDedicatedSocket,
@@ -604,10 +604,9 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
               socket = e.newSocket;
               // Short pause to let printer settle after new connection
               await Future.delayed(const Duration(milliseconds: 300));
-              if ((attempt + 1) == maxSendAttempts || ((model.isImageReceipt ?? false) && i > 0)) {
-                // If 2nd attempt still failed, let outer catch handle
-                // if is image receipt (image stripe content split) & failure occurs mid section,
-                // treat as a full failure to trigger fresh retry
+              if ((attempt + 1) == maxSendAttempts || (isImageBased && i > 0)) {
+                // If 2nd attempt failed, hand-off to outer catch.
+                // OR if image receipt (split by image stripe) & failure occurs on content section, fail completely. Hand-off to outer catch.
                 rethrow;
               } else {
                 // trigger next send attempt
@@ -969,10 +968,10 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
   }
 
   /***
-   * Sends one chunk, handles socket errors, returns active socket.
-   * Throws _SocketReconnectedException when a reconnect was needed, for caller to catch and handle a retry send
+   * Sends a chunk/section of data and handles socket error by throwing _SocketReconnectedException
+   * when a reconnect was needed, for caller to catch and handle a retry send
    */
-  Future<void> _sendChunk({
+  Future<void> _sendDataSection({
     required Socket socket,
     required TcpPrinterInput model,
     required bool useDedicatedSocket,
