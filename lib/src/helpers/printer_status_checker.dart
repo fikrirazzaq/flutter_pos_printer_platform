@@ -32,8 +32,8 @@ class PrinterStatusChecker {
 
   // GS r n — paper sensor status (buffered, may lag behind buffer)
   // Useful as fallback for printers that don't support DLE EOT
-  static const List<int> gsR1   = [0x1D, 0x72, 0x01]; // Paper sensor status (n=1)
-  static const List<int> gsR49  = [0x1D, 0x72, 0x31]; // Paper sensor status (n=49)
+  static const List<int> gsR1   = [0x1D, 0x72, 0x01]; // GS r 1: paper sensor (buffered fallback)
+  static const List<int> gsR49  = [0x1D, 0x72, 0x31]; // GS r 49: some Star/Generic models use n=49
 
   // paper sensor, older Epson (TM-T70, TM-U220)
   static const List<int> escV = [0x1B, 0x76];
@@ -215,39 +215,39 @@ class PrinterStatusChecker {
   static final Map<String, PrinterQueryResult> _queryResultCache = {};
   static const List<PrinterStatusCommand> _probeCommands = [
     PrinterStatusCommand(
-      bytes: PrinterStatusChecker.dleEot4,
-      statusType: PrinterStatusType.paper,
-      priority: 1,
-      canBlockPrint: true,
-    ),
-    PrinterStatusCommand(
-      bytes: gsR1, // GS r 1: paper sensor (buffered fallback)
-      statusType: PrinterStatusType.paper,
-      priority: 2,
-      canBlockPrint: true,
-    ),
-    PrinterStatusCommand(
-      bytes: gsR49, // GS r 49: some Star/Generic models use n=49
-      statusType: PrinterStatusType.paper,
-      priority: 3,
-      canBlockPrint: true,
-    ),
-    PrinterStatusCommand(
-      bytes: escV,
-      statusType: PrinterStatusType.paper,
-      priority: 4,
-      canBlockPrint: true,
-    ),
-    PrinterStatusCommand(
-      bytes: PrinterStatusChecker.dleEot2,
       statusType: PrinterStatusType.cover,
       priority: 1,
+      bytes: PrinterStatusChecker.dleEot2,
       canBlockPrint: true,
     ),
     PrinterStatusCommand(
-      bytes: PrinterStatusChecker.dleEot3,
+      statusType: PrinterStatusType.paper,
+      priority: 1,
+      bytes: PrinterStatusChecker.dleEot4,
+      canBlockPrint: true,
+    ),
+    PrinterStatusCommand(
+      statusType: PrinterStatusType.paper,
+      priority: 2,
+      bytes: gsR1,
+      canBlockPrint: true,
+    ),
+    PrinterStatusCommand(
+      statusType: PrinterStatusType.paper,
+      priority: 3,
+      bytes: gsR49,
+      canBlockPrint: true,
+    ),
+    PrinterStatusCommand(
+      statusType: PrinterStatusType.paper,
+      priority: 4,
+      bytes: escV,
+      canBlockPrint: true,
+    ),
+    PrinterStatusCommand(
       statusType: PrinterStatusType.error,
       priority: 1,
+      bytes: PrinterStatusChecker.dleEot3,
       canBlockPrint: true,
     ),
   ];
@@ -458,6 +458,8 @@ class PrinterStatusChecker {
         if (listEquals(command.bytes, dleEot4)) {
           // Bits 5,6: paper end sensor — On = paper not present
           if ((response & 0x60) != 0) return PrinterHwStatus.paperOut;
+          // Standard ESC/POS Paper Low bitmask (0x0C checks both Bit 3 and Bit 4)
+          // bool isPaperLow = (response & 0x0C) != 0;
           return PrinterHwStatus.ready;
         }
         if (listEquals(command.bytes, gsR1) || listEquals(command.bytes, gsR49)) {
@@ -477,7 +479,17 @@ class PrinterStatusChecker {
 
       case PrinterStatusType.cover:
         if (listEquals(command.bytes, dleEot2)) {
+          // Bit 2: Cover Status (0 = Closed, 1 = Open)
           if ((response & 0x04) != 0) return PrinterHwStatus.coverOpen;
+          // Bit 3: FEED Button Status (0 = Not pressed, 1 = Pressed)
+          // Indicates the physical button on the housing is actively being held down.
+          if ((response & 0x08) != 0) return PrinterHwStatus.feedBtnPressed;
+          // Bit 5: Printing Stop Status (0 = Normal, 1 = Stopped)
+          // Triggered when the printer halts execution because a sensor lacks paper.
+          if ((response & 0x20) != 0) return PrinterHwStatus.error;
+          // Bit 6: Error Status (0 = No error, 1 = Error occurred)
+          // Active during cutter jams, thermal overheating, or board faults.
+          if ((response & 0x40) != 0) return PrinterHwStatus.error; // Checks Bit 6
           return PrinterHwStatus.ready;
         }
         return PrinterHwStatus.unknown;
@@ -528,9 +540,9 @@ class PrinterQueryResult {
   });
 
   PrinterHwStatus get hwCondition {
-    if (coverStatus == PrinterHwStatus.coverOpen) return coverStatus;
-    if (paperStatus == PrinterHwStatus.paperOut) return paperStatus;
-    if (errorStatus == PrinterHwStatus.error) return errorStatus;
+    if (coverStatus != PrinterHwStatus.unknown) return coverStatus;
+    if (paperStatus != PrinterHwStatus.unknown) return paperStatus;
+    if (errorStatus != PrinterHwStatus.unknown) return errorStatus;
     // Assume printer in ready condition
     return PrinterHwStatus.ready;
   }
@@ -541,7 +553,7 @@ class PrinterQueryResult {
 
   @override
   String toString() =>
-      'PrinterQueryResult(paper=${paperStatus.name}, cover=${coverStatus.name}, error=${errorStatus.name}, lastQueried=${lastQueried})';
+      'PrinterQueryResult(paperCommand=${paperCommand?.priority}, paperStatus=${paperStatus.name}, coverCommand=${coverCommand?.priority}, coverStatus=${coverStatus.name}, errorCommand=${errorCommand?.priority}, errorStatus=${errorStatus.name}, lastQueried=${lastQueried})';
 }
 
 extension on List<int> {

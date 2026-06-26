@@ -19,6 +19,7 @@ enum PrinterHwStatus {
   coverOpen, // Printer reports cover open
   error, // Printer reports an error condition
   notResponding, // Status query sent but no response within timeout
+  feedBtnPressed,
 }
 
 class PrinterConnectStatusResult {
