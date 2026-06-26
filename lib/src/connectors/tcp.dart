@@ -576,25 +576,9 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         }
       }
 
-      // Calculate adaptive delays based on data size
-      final contentSections = bytes.where((section) {
-        // For image receipts, exclude sync pulse sections (ESC @ = 2 bytes) and drain sentinel (0 bytes) from size calculation.
-        // These are timing/control sections, not content — including them would inflate sectionCount and trigger unnecessary delay increases.
-        return section.isNotEmpty && ((model.isImageReceipt ?? false) ? section.length > 4 : true);
-      });
-      int totalSize = contentSections.fold(0, (sum, section) => sum + section.length);
-      int sectionCount = contentSections.length;
-
-      // Calculate optimal delay between chunks (larger sections need more time)
-      int adaptiveDelay = delayBetweenMs;
-      if (sectionCount > 10) {
-        adaptiveDelay = delayBetweenMs + 30;
-      } else if (totalSize > 50000) {
-        adaptiveDelay = delayBetweenMs + 20;
-      }
-
+      int totalSize = bytes.fold(0, (sum, section) => sum + section.length);
       _log(
-          '2. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} sending ${bytes.length} sections, total size: $totalSize bytes, delay: $adaptiveDelay ms');
+          '2. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} sending ${bytes.length} sections, total size: $totalSize bytes');
 
       // More conservative flushing strategy
       for (int i = 0; i < bytes.length; i++) {
@@ -640,21 +624,13 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
             '3. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Sent section:$i, ${sectionData.isEmpty ? 'drain gap' : '${sectionData.length} bytes'}',
             level: 'info');
         if (i < bytes.length - 1) {
-          int currentDelay = adaptiveDelay;
-          if (i == 0) {
-            // 1st section is printer reset command, use base value
-            currentDelay = delayBetweenMs;
-          } else if (i - 1 == bytes.length - 1 && sectionData.isEmpty) {
-            // This likely to applies on empty section before "cut" command
-            // To avoid premature cut (especially on fast speed printer),
-            // treat empty section as an extra wait for previous data to print completely
-            currentDelay = adaptiveDelay;
-          } else {
-            // Likely applies to content section
-            if (sectionData.length > 4096) {
-              currentDelay += 20; // Additional delay for larger sections
-            }
-          }
+          final currentDelay = _calculateInterSectionDelay(
+            baseDelayMs: 50,
+            isImageBased: isImageBased,
+            currentSection: sectionData,
+            sectionIndex: i,
+            sectionCount: bytes.length,
+          );
           _log(
               '3.1. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Sent section:$i ${sectionData.length} bytes, delay $currentDelay',
               level: 'info');
@@ -1056,6 +1032,43 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
       _log('$ip Reconnected (shared)', level: 'info');
       return socket;
     }
+  }
+
+  int _calculateInterSectionDelay({
+    required int baseDelayMs,
+    required bool isImageBased,
+    required List<int> currentSection,
+    required int sectionIndex,
+    required int sectionCount,
+  }) {
+    if (isImageBased) {
+      // ── Image: reset section
+      // Fixed window for printer to complete initialisation before image data arrives
+      if (sectionIndex == 0) return baseDelayMs;
+
+      // ── Image: drain sentinel (empty section before cut)
+      // Gives printer time to finish physically printing the last image chunk
+      // before the cut command arrives.
+      // 150ms covers worst-case: ~12mm paper travel at 80mm/s (slowest printer tier)
+      if (currentSection.isEmpty && (sectionIndex == sectionCount - 2)) return 150;
+    }
+
+    // ── Image: stripe chunk / Text: command chunk
+    // Calculates print time from section byte size using worst-case print speed (80mm/s) — safe across all printer
+    // tiers since faster printers simply wait slightly longer than needed.
+    //
+    // Formula: printTimeMs = sectionBytes / (dotsPerMm × printSpeedMmPerMs)
+    //                      = sectionBytes / (8 × 0.080)
+    //                      = sectionBytes / 0.64
+    //                      ≈ sectionBytes * 10 / 6400   (integer arithmetic)
+    //
+    // Text sections over-estimate slightly since text renders from font ROM faster than raw pixel streaming — safe,
+    // not a correctness issue.
+    final int printTimeMs = (currentSection.length * 10) ~/ 6400;
+
+    // +20ms safety margin: covers TCP jitter, firmware processing overhead, and ensures buffer headroom
+    // before the next section arrives.
+    return (printTimeMs + 20).clamp(baseDelayMs, 300);
   }
 }
 
