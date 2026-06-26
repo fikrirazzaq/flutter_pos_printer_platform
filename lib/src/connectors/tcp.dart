@@ -16,7 +16,6 @@ class TcpPrinterInput extends BasePrinterInput {
   final Duration timeout;
   final Duration retryInterval;
   final int maxRetries;
-  final bool? isImageReceipt;
 
   TcpPrinterInput({
     required this.ipAddress,
@@ -24,7 +23,6 @@ class TcpPrinterInput extends BasePrinterInput {
     this.timeout = const Duration(seconds: 5),
     this.retryInterval = const Duration(seconds: 1),
     this.maxRetries = 3,
-    this.isImageReceipt,
   });
 }
 
@@ -531,7 +529,8 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     TcpPrinterInput? model,
     int delayBetweenMs = 50,
     bool useDedicatedSocket = false,
-    bool preSendQueryStatus = false,
+    required bool queryStatusPreSend,
+    required bool isImageBased,
   }) async {
     if (model == null) {
       return PrinterConnectStatusResult(isSuccess: false, exception: 'TCP model is null');
@@ -565,13 +564,16 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         socket = await _reconnectSocket(model, useDedicatedSocket);
       }
 
-      if (preSendQueryStatus) {
-        final PrinterQueryResult status =
+      PrinterQueryResult? queryResult;
+      if (queryStatusPreSend) {
+        queryResult =
             await PrinterStatusChecker.queryPrinterStatus(socket, '${model.ipAddress}:${model.port}', cacheTtl: 5);
-        if (status.hwCondition != PrinterHwStatus.ready) {
+        if (queryResult.hwCondition != PrinterHwStatus.ready) {
           return PrinterConnectStatusResult(
             isSuccess: false,
-            printerStatus: status.hwCondition,
+            exception: 'Pre-send check, printer is not ready: ${queryResult.hwCondition}',
+            printerStatus: queryResult.hwCondition,
+            queryResult: queryResult,
           );
         }
       }
@@ -580,7 +582,6 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
       _log(
           '2. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} sending ${bytes.length} sections, total size: $totalSize bytes');
 
-      // More conservative flushing strategy
       for (int i = 0; i < bytes.length; i++) {
         final sectionData = bytes[i];
         if (sectionData.isNotEmpty) {
@@ -622,8 +623,9 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         _log(
             '3. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Sent section:$i, ${sectionData.isEmpty ? 'drain gap' : '${sectionData.length} bytes'}',
             level: 'info');
+        // Apply inter-section delay
         if (i < bytes.length - 1) {
-          final currentDelay = _calculateInterSectionDelay(
+          final delayAfterSection = _calculateInterSectionDelay(
             baseDelayMs: 50,
             isImageBased: isImageBased,
             currentSection: sectionData,
@@ -631,9 +633,9 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
             sectionCount: bytes.length,
           );
           _log(
-              '3.1. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Sent section:$i ${sectionData.length} bytes, delay $currentDelay',
+              '3.1. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Sent section:$i ${sectionData.length} bytes, delay $delayAfterSection',
               level: 'info');
-          await Future.delayed(Duration(milliseconds: currentDelay));
+          await Future.delayed(Duration(milliseconds: delayAfterSection));
         }
       }
 
@@ -643,8 +645,15 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
       _log('4. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Successfully sent all ${bytes.length} print sections',
           level: 'warn');
 
+      if (!queryStatusPreSend && socket != null) {
+        queryResult =
+            await PrinterStatusChecker.queryPrinterStatus(socket, '${model.ipAddress}:${model.port}', cacheTtl: 5);
+      }
+
       return PrinterConnectStatusResult(
         isSuccess: true,
+        printerStatus: queryResult?.hwCondition ?? PrinterHwStatus.unknown,
+        queryResult: queryResult,
       );
     } catch (e, stackTrace) {
       _log('splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} failed: $e',

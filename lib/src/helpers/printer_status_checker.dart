@@ -598,6 +598,7 @@ class PrinterQueryResult {
   });
 
   PrinterHwStatus get hwCondition {
+    // By priority order -> cover, paper, error state
     if (coverStatus != PrinterHwStatus.unknown) return coverStatus;
     if (paperStatus != PrinterHwStatus.unknown) return paperStatus;
     if (errorStatus != PrinterHwStatus.unknown) return errorStatus;

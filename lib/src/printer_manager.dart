@@ -214,25 +214,26 @@ class PrinterManager {
     required List<List<int>> bytes,
     BasePrinterInput? model,
     int delayBetweenMs = 50,
-    bool preSendQueryStatus = false,
+    bool useSplitSendV2 = false,
+    bool queryStatusPreSend = false,
+    bool isImageBased = false,
   }) async {
     if (type == PrinterType.bluetooth && (Platform.isIOS || Platform.isAndroid)) {
       return await bluetoothPrinterConnector.splitSend(bytes);
     } else if (type == PrinterType.usb && (Platform.isAndroid || Platform.isWindows)) {
       return await usbPrinterConnector.splitSend(bytes);
     } else {
-      // Route to splitSendV2 for any receipt that explicitly declares TcpPrinterInput.isImageReceipt.
-      // Non-kitchen receipts don't set isImageReceipt — they use the legacy path until migrated. This is an intentional staged rollout.
-      final tcpModel = model as TcpPrinterInput?;
-      if (tcpModel?.isImageReceipt != null) {
+      if (useSplitSendV2) {
         return await tcpPrinterConnector.splitSendV2(bytes,
-          model: tcpModel,
+          model: model as TcpPrinterInput?,
           delayBetweenMs: delayBetweenMs,
           useDedicatedSocket: useDedicatedSocket,
-          preSendQueryStatus: preSendQueryStatus,);
+          queryStatusPreSend: queryStatusPreSend,
+          isImageBased: isImageBased
+        );
       } else {
         return await tcpPrinterConnector.splitSend(bytes,
-            model: tcpModel, delayBetweenMs: delayBetweenMs, useDedicatedSocket: useDedicatedSocket);
+            model: model as TcpPrinterInput?, delayBetweenMs: delayBetweenMs, useDedicatedSocket: useDedicatedSocket);
       }
     }
   }
