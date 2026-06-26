@@ -979,7 +979,7 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     required List<int> sectionData,
     required int sectionIndex,
   }) async {
-    var flushTimeout = const Duration(seconds: 5);
+    var flushTimeout = const Duration(seconds: 2);
     try {
       socket.add(Uint8List.fromList(sectionData));
     } catch (e, s) {
