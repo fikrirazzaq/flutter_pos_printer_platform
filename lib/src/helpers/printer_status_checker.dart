@@ -303,14 +303,17 @@ class PrinterStatusChecker {
               case PrinterStatusType.paper:
                 profile.paperCommand = command;
                 profile.paperStatus = status;
+                profile.paperLastBytes = response;
                 break;
               case PrinterStatusType.cover:
                 profile.coverCommand = command;
                 profile.coverStatus = status;
+                profile.coverLastBytes = response;
                 break;
               case PrinterStatusType.error:
                 profile.errorCommand = command;
                 profile.errorStatus = status;
+                profile.errorLastBytes = response;
                 break;
             }
             // break `candidates` loop after working command for x status identified
@@ -355,15 +358,25 @@ class PrinterStatusChecker {
                 .priority} ${profile.coverCommand!.bytes.toHex()}..');
         final response = await _getStatusResponse(socket, responseStream.stream, profile.coverCommand!.bytes);
         if (response != null) {
+          profile.coverLastBytes = response;
           profile.coverStatus = _decodeStatusResponse(profile.coverCommand!, response);
           debugPrint(
               '${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse cover ${profile.coverCommand!
                   .priority} ${profile.coverCommand!.bytes.toHex()}.. RESPONDED dec=${response}, hex=${response
                   .toRadixString(16).padLeft(2, '0')}, status=${profile.coverStatus.name}');
         } else {
-          // Previous command not working anymore
-          profile.coverCommand = null;
-          profile.coverStatus = PrinterHwStatus.ready;
+          // Previous command not working anymore, likely the printer model is changed or current printer status is different (i.e: normal -> paper out)
+          final (newRespondedCommand, response) = await _reDiscoverPrinterProfile(
+              socket, responseStream, printerKey, type: PrinterStatusType.cover, currentCommand: profile.coverCommand!);
+          if (newRespondedCommand != null && response != null) {
+            profile.coverLastBytes = response;
+            profile.coverStatus = _decodeStatusResponse(newRespondedCommand, response);
+            profile.coverCommand = newRespondedCommand;
+            debugPrint(
+                '${printerKey} (queryPrinterStatus) _reDiscoverPrinterProfile -> _getStatusResponse ${PrinterStatusType.cover} ${newRespondedCommand.priority} ${newRespondedCommand.bytes.toHex()}.. RESPONDED dec=${response}, hex=${response.toRadixString(16).padLeft(2, '0')}, status=${profile.coverStatus.name}');
+          } else {
+            profile.coverStatus = PrinterHwStatus.unknown;
+          }
         }
       }
 
@@ -375,26 +388,36 @@ class PrinterStatusChecker {
         await Future.delayed(const Duration(milliseconds: 30)); // let buffer settle
         final response = await _getStatusResponse(socket, responseStream.stream, profile.paperCommand!.bytes);
         if (response != null) {
+          profile.paperLastBytes = response;
           profile.paperStatus = _decodeStatusResponse(profile.paperCommand!, response);
           debugPrint(
               '${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse paper ${profile.paperCommand!
                   .priority} ${profile.paperCommand!.bytes.toHex()}.. RESPONDED dec=${response}, hex=${response
                   .toRadixString(16).padLeft(2, '0')}, status=${profile.paperStatus.name}');
         } else {
-          // Previous command not working anymore
-          profile.paperCommand = null;
-          profile.paperStatus = PrinterHwStatus.ready;
+          // Previous command not working anymore, likely the printer model is changed or current printer status is different (i.e: normal -> paper out)
+          final (newRespondedCommand, response) = await _reDiscoverPrinterProfile(
+              socket, responseStream, printerKey, type: PrinterStatusType.paper, currentCommand: profile.paperCommand!);
+          if (newRespondedCommand != null && response != null) {
+            profile.paperLastBytes = response;
+            profile.paperStatus = _decodeStatusResponse(newRespondedCommand, response);
+            profile.paperCommand = newRespondedCommand;
+            debugPrint('${printerKey} (queryPrinterStatus) _reDiscoverPrinterProfile -> _getStatusResponse ${PrinterStatusType.paper} ${newRespondedCommand.priority} ${newRespondedCommand.bytes.toHex()}.. RESPONDED dec=${response}, hex=${response.toRadixString(16).padLeft(2, '0')}, status=${profile.paperStatus.name}');
+          } else {
+            profile.paperStatus = PrinterHwStatus.unknown;
+          }
         }
       }
 
       // Error Check
-      if (profile.errorCommand != null && (profile.isCoverNormal && profile.isPaperNormal)) {
+      if (profile.errorCommand != null && profile.isCoverNormal && profile.isPaperNormal) {
         debugPrint(
             '${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse errorstate ${profile
                 .errorCommand!.priority} ${profile.errorCommand!.bytes.toHex()}..');
         await Future.delayed(const Duration(milliseconds: 30)); // let buffer settle
         final response = await _getStatusResponse(socket, responseStream.stream, profile.errorCommand!.bytes);
         if (response != null) {
+          profile.errorLastBytes = response;
           profile.errorStatus = _decodeStatusResponse(profile.errorCommand!, response);
           debugPrint(
               '${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse errorstate ${profile
@@ -402,9 +425,18 @@ class PrinterStatusChecker {
                   .toHex()}.. RESPONDED dec=${response}, hex=${response.toRadixString(16).padLeft(
                   2, '0')}, status=${profile.errorStatus.name}');
         } else {
-          // Previous command not working anymore
-          profile.errorCommand = null;
-          profile.errorStatus = PrinterHwStatus.ready;
+          // Previous command not working anymore, likely the printer model is changed or current printer status is different (i.e: normal -> paper out)
+          final (newRespondedCommand, response) = await _reDiscoverPrinterProfile(
+              socket, responseStream, printerKey, type: PrinterStatusType.error, currentCommand: profile.errorCommand!);
+          if (newRespondedCommand != null && response != null) {
+            profile.errorLastBytes = response;
+            profile.errorStatus = _decodeStatusResponse(newRespondedCommand, response);
+            profile.errorCommand = newRespondedCommand;
+            debugPrint(
+                '${printerKey} (queryPrinterStatus) _reDiscoverPrinterProfile -> _getStatusResponse ${PrinterStatusType.error} ${newRespondedCommand.priority} ${newRespondedCommand.bytes.toHex()}.. RESPONDED dec=${response}, hex=${response.toRadixString(16).padLeft(2, '0')}, status=${profile.errorStatus.name}');
+          } else {
+            profile.errorStatus = PrinterHwStatus.unknown;
+          }
         }
       }
     } catch (e) {
@@ -418,6 +450,27 @@ class PrinterStatusChecker {
     _queryResultCache[printerKey] = profile;
 
     return profile;
+  }
+
+  static Future<(PrinterStatusCommand?, int?)> _reDiscoverPrinterProfile(
+      Socket socket, StreamController<int> responseStream, String printerKey,
+      {required PrinterStatusType type, required PrinterStatusCommand currentCommand}) async {
+    final candidates = _probeCommands.where((c) => c.statusType == type && c.priority != currentCommand.priority).toList()
+      ..sort((a, b) => a.priority.compareTo(b.priority));
+    if (candidates.isNotEmpty) {
+      await Future.delayed(const Duration(milliseconds: 30)); // let buffer settle from previous not responded cached command
+    }
+    for (final command in candidates) {
+      debugPrint(
+          '${printerKey} (queryPrinterStatus) _reDiscoverPrinterProfile -> _getStatusResponse ${type.name} ${command
+              .priority} ${command.bytes.toHex()}..');
+      final response = await _getStatusResponse(socket, responseStream.stream, command.bytes);
+      await Future.delayed(const Duration(milliseconds: 30)); // let buffer settle
+      if (response != null) {
+        return (command, response);
+      }
+    }
+    return (null, null);
   }
 
   static Future<int?> _getStatusResponse(Socket socket, Stream<int> byteStream, List<int> command) async {
@@ -519,21 +572,26 @@ class PrinterStatusCommand {
 }
 
 class PrinterQueryResult {
-  PrinterStatusCommand? paperCommand;
-  PrinterHwStatus paperStatus;
   PrinterStatusCommand? coverCommand;
   PrinterHwStatus coverStatus;
+  int? coverLastBytes;
+
+  PrinterStatusCommand? paperCommand;
+  PrinterHwStatus paperStatus;
+  int? paperLastBytes;
+
   PrinterStatusCommand? errorCommand;
   PrinterHwStatus errorStatus;
+  int? errorLastBytes;
 
   /// Timestamp of last successful query — used for TTL check
   DateTime? lastQueried;
 
   PrinterQueryResult({
-    this.paperCommand,
-    this.paperStatus = PrinterHwStatus.unknown,
     this.coverCommand,
     this.coverStatus = PrinterHwStatus.unknown,
+    this.paperCommand,
+    this.paperStatus = PrinterHwStatus.unknown,
     this.errorCommand,
     this.errorStatus = PrinterHwStatus.unknown,
     this.lastQueried,
@@ -547,13 +605,18 @@ class PrinterQueryResult {
     return PrinterHwStatus.ready;
   }
 
+  bool get isCoverNormal =>
+      coverStatus != PrinterHwStatus.coverOpen &&
+      coverStatus != PrinterHwStatus.feedBtnPressed &&
+      coverStatus != PrinterHwStatus.error;
+
   bool get isPaperNormal => paperStatus != PrinterHwStatus.paperOut;
-  bool get isCoverNormal => coverStatus != PrinterHwStatus.coverOpen;
+
   bool get isStateNormal => errorStatus != PrinterHwStatus.error;
 
   @override
   String toString() =>
-      'PrinterQueryResult(paperCommand=${paperCommand?.priority}, paperStatus=${paperStatus.name}, coverCommand=${coverCommand?.priority}, coverStatus=${coverStatus.name}, errorCommand=${errorCommand?.priority}, errorStatus=${errorStatus.name}, lastQueried=${lastQueried})';
+      'PrinterQueryResult(paperCommand=${paperCommand?.priority}, paperStatus=${paperStatus.name}, paperLastBytes=${paperLastBytes}, coverCommand=${coverCommand?.priority}, coverStatus=${coverStatus.name}, coverLastBytes=${coverLastBytes}, errorCommand=${errorCommand?.priority}, errorStatus=${errorStatus.name}, errorLastBytes=${errorLastBytes}, lastQueried=${lastQueried})';
 }
 
 extension on List<int> {
