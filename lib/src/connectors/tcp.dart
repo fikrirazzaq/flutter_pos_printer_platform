@@ -80,9 +80,11 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     }
   }
 
-  // Dedicated socket per printer IP
-  final socketsPerIp = <String, Socket>{};
-  final _socketStatuses = <String, TCPStatus>{};
+  // Per-IP mutex: prevents two concurrent operations on the same IP from creating duplicate sockets or tearing down a socket mid-send.
+  final Map<String, Completer<void>> _ipLocks = {};
+
+  // Primary registry: IP → socket entry
+  final Map<String, _SocketEntry> _socketRegistry = {};
 
   // Connect to printers using shared socket (_socket)
   @override
@@ -162,22 +164,25 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     TcpPrinterInput? model,
     bool useDedicatedSocket = false
   }) async {
+    if (model == null) {
+      return PrinterConnectStatusResult(isSuccess: false, exception: 'TCP model is null');
+    }
+
     final connectionStatus = await _checkConnectionStatus(model, useDedicatedSocket);
     if (!connectionStatus.isSuccess) return connectionStatus;
 
+    final ip = model.ipAddress;
     try {
-      if (useDedicatedSocket) {
-        final socket = socketsPerIp[model!.ipAddress];
-        socket!.add(Uint8List.fromList(bytes));
-        await socket!.flush();
-      } else {
-        _socket!.add(Uint8List.fromList(bytes));
-        await _socket!.flush();
+      final socket = useDedicatedSocket ? _socketRegistry[ip]?.socket : _socket;
+      if (socket == null) {
+        return PrinterConnectStatusResult(isSuccess: false, exception: 'socket is not established');
       }
+      socket.add(Uint8List.fromList(bytes));
+      await socket.flush();
       return PrinterConnectStatusResult(isSuccess: true);
     } catch (e, stackTrace) {
       if (useDedicatedSocket) {
-        _socketStatuses[model!.ipAddress] = TCPStatus.none;
+        _socketRegistry[ip]?.status = TCPStatus.none;
         return PrinterConnectStatusResult(
           isSuccess: false,
           exception: 'Send error: $e',
@@ -271,6 +276,10 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     int delayBetweenMs = 50,
     bool useDedicatedSocket = false
   }) async {
+    if (model == null) {
+      return PrinterConnectStatusResult(isSuccess: false, exception: 'TCP model is null');
+    }
+
     _log(
         '1. splitSend ${bytes.length} sections to print, total size: ${bytes.fold(0, (sum, item) => sum + item.length)} bytes',
         level: 'warn');
@@ -279,23 +288,25 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     final connectionStatus = await _checkConnectionStatus(model, useDedicatedSocket);
     if (!connectionStatus.isSuccess) return connectionStatus;
 
-    final extraLog = '(useDedicatedSocket:$useDedicatedSocket ${model?.ipAddress})';
-    var socketConnection = useDedicatedSocket ? socketsPerIp[model?.ipAddress] : _socket;
+    final extraLog = '(useDedicatedSocket:$useDedicatedSocket ${model.ipAddress})';
+    var socketConnection = useDedicatedSocket ? _socketRegistry[model.ipAddress]?.socket : _socket;
+
+    await _acquireLock(model.ipAddress);
+
     try {
       if (socketConnection == null) {
-        throw SocketException('Socket is null');
+        throw SocketException('${model.ipAddress} Socket is null');
       }
 
-      _log('2.0. Socket close $extraLog');
+      // _log('2.0. Socket close $extraLog');
       // await _socket!.close();
       try {
         // Set important socket options for printer communication
         socketConnection.setOption(SocketOption.tcpNoDelay, true);
       } catch (e, s) {
-        if (model != null) {
-          _log('2. Split send connect $extraLog');
-          useDedicatedSocket ? await connectDedicatedSocket(model) : await connect(model);
-        }
+        _log('2. Split send connect $extraLog');
+        useDedicatedSocket ? await connectDedicatedSocket(model) : await connect(model);
+        socketConnection = useDedicatedSocket ? _socketRegistry[model.ipAddress]?.socket : _socket;
       }
 
       // Calculate adaptive delays based on data size
@@ -336,7 +347,7 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
                   final PrinterConnectStatusResult result =
                       useDedicatedSocket ? await connectDedicatedSocket(model) : await connect(model);
                   if (result.isSuccess) {
-                    socketConnection = useDedicatedSocket ? socketsPerIp[model.ipAddress] : _socket;
+                    socketConnection = useDedicatedSocket ? _socketRegistry[model.ipAddress]?.socket : _socket;
                     if (socketConnection == null) {
                       throw SocketException('Socket is null');
                     }
@@ -368,7 +379,7 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
               _log('Flush timed out, destroying socket immediately', level: 'warn');
               validSocket.destroy();
               if (useDedicatedSocket) {
-                socketsPerIp.remove(model?.ipAddress);
+                _socketRegistry.remove(model.ipAddress);
               } else {
                 _socket = null;
               }
@@ -389,7 +400,7 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
                 final PrinterConnectStatusResult result =
                     useDedicatedSocket ? await connectDedicatedSocket(model) : await connect(model);
                 if (result.isSuccess) {
-                  socketConnection = useDedicatedSocket ? socketsPerIp[model.ipAddress] : _socket;
+                  socketConnection = useDedicatedSocket ? _socketRegistry[model.ipAddress]?.socket : _socket;
                   if (socketConnection == null) {
                     throw SocketException('Socket is null');
                   }
@@ -423,7 +434,7 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
             _log('Flush timed out, destroying socket immediately', level: 'warn');
             validSocket.destroy();
             if (useDedicatedSocket) {
-              socketsPerIp.remove(model?.ipAddress);
+              _socketRegistry.remove(model.ipAddress);
             } else {
               _socket = null;
             }
@@ -497,8 +508,8 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
 
       if (useDedicatedSocket) {
         if (model != null) {
-          _socketStatuses[model.ipAddress] = TCPStatus.none;
-          await _safeCloseSocket(printerIp: model.ipAddress);
+          _socketRegistry[model.ipAddress]?.status = TCPStatus.none;
+          await _closeIpDedicatedSocket(model.ipAddress);
         }
       } else {
         status = TCPStatus.none;
@@ -509,6 +520,164 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         exception: 'Split send error $extraLog: $e',
         stackTrace: stackTrace,
       );
+    } finally {
+      _releaseLock(model.ipAddress);
+    }
+  }
+
+  Future<PrinterConnectStatusResult> splitSendV2(List<List<int>> bytes, {
+    TcpPrinterInput? model,
+    int delayBetweenMs = 50,
+    bool useDedicatedSocket = false,
+    required bool queryStatusPreSend,
+    required bool isImageBased,
+  }) async {
+    if (model == null) {
+      return PrinterConnectStatusResult(isSuccess: false, exception: 'TCP model is null');
+    }
+
+    final ip = model.ipAddress;
+    _log(
+        '1. splitSendV2 $ip ${bytes.length} sections to print, total size: ${bytes.fold(0, (sum, item) => sum + item.length)} bytes',
+        level: 'warn');
+
+    // Ensure properly connected
+    final connectionStatus = await _checkConnectionStatus(model, useDedicatedSocket);
+    if (!connectionStatus.isSuccess) {
+      return connectionStatus;
+    }
+
+    // Acquire IP lock — blocks concurrent prints to same printer
+    await _acquireLock(ip);
+
+    try {
+      Socket? socket = useDedicatedSocket ? _socketRegistry[ip]?.socket : _socket;
+      if (socket == null) {
+        throw SocketException('$ip Socket is null after lock acquired');
+      }
+
+      try {
+        socket.setOption(SocketOption.tcpNoDelay, true);
+      } catch (e) {
+        // Socket dead before we even started — reconnect now before sending anything
+        _log('$ip socket dead before send (setOption failed) — reconnecting', level: 'warn');
+        socket = await _reconnectSocket(model, useDedicatedSocket);
+      }
+
+      PrinterQueryResult? queryResult;
+      if (queryStatusPreSend) {
+        queryResult =
+            await PrinterStatusChecker.queryPrinterStatus(socket, '${model.ipAddress}:${model.port}', cacheTtl: 5);
+        if (queryResult.hwCondition != PrinterHwStatus.ready) {
+          return PrinterConnectStatusResult(
+            isSuccess: false,
+            exception: 'Pre-send check, printer is not ready: ${queryResult.hwCondition}',
+            printerStatus: queryResult.hwCondition,
+            queryResult: queryResult,
+          );
+        }
+      }
+
+      int totalSize = bytes.fold(0, (sum, section) => sum + section.length);
+      _log(
+          '2. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} sending ${bytes.length} sections, total size: $totalSize bytes');
+
+      for (int i = 0; i < bytes.length; i++) {
+        final sectionData = bytes[i];
+        if (sectionData.isNotEmpty) {
+          const int maxSendAttempts = 2;
+          int attempt = 1;
+
+          sendAttempt:
+          while (attempt <= maxSendAttempts) {
+            try {
+              await _sendDataSection(
+                socket: socket!,
+                model: model,
+                useDedicatedSocket: useDedicatedSocket,
+                sectionData: sectionData,
+                sectionIndex: i,
+              );
+              // no issue on first attempt, exit from while scope
+              break sendAttempt;
+            } on _SocketReconnectedException catch (e) {
+              // socket is reconnected & replaced mid-send, retry with new socketConnection
+              socket = e.newSocket;
+              // Short pause to let printer settle after new connection
+              await Future.delayed(const Duration(milliseconds: 300));
+              if ((attempt + 1) == maxSendAttempts || (isImageBased && i > 0)) {
+                // If 2nd attempt failed, hand-off to outer catch.
+                // OR if image receipt (split by image stripe) & failure occurs on content section, fail completely. Hand-off to outer catch.
+                rethrow;
+              } else {
+                // trigger next send attempt
+                attempt++;
+                _log('$ip${useDedicatedSocket ? '' : ' (shared)'} socket replaced when sending section:$i, retry send #$attempt', level: 'warn');
+              }
+            } catch (e, s) {
+              rethrow; // handle by outer catch
+            }
+          }
+        }
+
+        _log(
+            '3. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Sent section:$i, ${sectionData.isEmpty ? 'drain gap' : '${sectionData.length} bytes'}',
+            level: 'info');
+        // Apply inter-section delay
+        if (i < bytes.length - 1) {
+          final delayAfterSection = _calculateInterSectionDelay(
+            baseDelayMs: 50,
+            isImageBased: isImageBased,
+            currentSection: sectionData,
+            sectionIndex: i,
+            sectionCount: bytes.length,
+          );
+          _log(
+              '3.1. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Sent section:$i ${sectionData.length} bytes, delay $delayAfterSection',
+              level: 'info');
+          await Future.delayed(Duration(milliseconds: delayAfterSection));
+        }
+      }
+
+      // Give printer time to process before returning
+      await Future.delayed(Duration(milliseconds: 200));
+
+      _log('4. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Successfully sent all ${bytes.length} print sections',
+          level: 'warn');
+
+      if (!queryStatusPreSend && socket != null) {
+        queryResult =
+            await PrinterStatusChecker.queryPrinterStatus(socket, '${model.ipAddress}:${model.port}', cacheTtl: 5);
+      }
+
+      return PrinterConnectStatusResult(
+        isSuccess: true,
+        printerStatus: queryResult?.hwCondition ?? PrinterHwStatus.unknown,
+        queryResult: queryResult,
+      );
+    } catch (e, stackTrace) {
+      _log('splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} failed: $e',
+          level: 'error', error: e, stackTrace: stackTrace);
+
+      // Record printer issues
+      String printerKey = '${model.ipAddress}:${model.port}';
+      _problematicPrinters[printerKey] = DateTime.now();
+
+      // Close socket
+      if (useDedicatedSocket) {
+        _socketRegistry[ip]?.status = TCPStatus.none;
+        await _closeIpDedicatedSocket(ip);
+      } else {
+        status = TCPStatus.none;
+        await _safeCloseSocket();
+      }
+      return PrinterConnectStatusResult(
+        isSuccess: false,
+        exception: 'splitSendV2 error $ip${useDedicatedSocket ? '' : ' (shared)'}: $e',
+        stackTrace: stackTrace,
+      );
+    } finally {
+      _releaseLock(ip);
     }
   }
 
@@ -521,11 +690,11 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     }
 
     if (useDedicatedSocket) {
-      if (_socketStatuses[model.ipAddress] != TCPStatus.connected) {
-        final connectResult = await connectDedicatedSocket(model);
-        return connectResult;
-      } else {
+      final isConnected = _socketRegistry[model.ipAddress]?.status == TCPStatus.connected;
+      if (isConnected) {
         return PrinterConnectStatusResult(isSuccess: true);
+      } else {
+        return await connectDedicatedSocket(model);
       }
     } else {
       if (!isConnected) {
@@ -547,27 +716,23 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     return result;
   }
 
-  Future<void> _safeCloseSocket({String? printerIp}) async {
-    final socketToClose = printerIp != null ? socketsPerIp[printerIp] : this._socket;
+  Future<void> _safeCloseSocket() async {
+    final socketToClose = this._socket;
     if (socketToClose == null) {
       return;
     }
 
     // Nullify reference immediately so no other call touches this socket
-    if (printerIp != null) {
-      socketsPerIp.remove(printerIp);
-    } else {
-      _socket = null;
-    }
+    _socket = null;
 
     try {
       // Skip flush — this is always a teardown path.
       // flush() on a dangling sink throws Bad state; there's no data worth saving.
       await socketToClose.close().timeout(Duration(milliseconds: 500));
-      _log('${printerIp ?? ''}Socket closed successfully', level: 'debug');
+      _log('Socket closed successfully', level: 'debug');
     } catch (e, s) {
       // close() failed or timed out — destroy() below handles actual cleanup
-      _log('${printerIp ?? ''}Socket close failed - cleanup handled by destroy(). Err: $e', level: 'warn', error: e, stackTrace: s);
+      _log('Socket close failed - cleanup handled by destroy()', level: 'error', error: e, stackTrace:  s);
     } finally {
       // Unconditional — the only guaranteed cleanup for OS-level socket resources
       try {
@@ -597,79 +762,68 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     }
   }
 
-  // Connect to printers using 1 socket per IP (_sockets)
+  // Connect to printers using IP-dedicated-socket (_socketRegistry)
   @override
   Future<PrinterConnectStatusResult> connectDedicatedSocket(TcpPrinterInput model) async {
-    // Clear any existing socket first
-    // await _safeCloseSocket(printerIp: model.ipAddress);
+    final ip = model.ipAddress;
+    final printerKey = '${model.ipAddress}:${model.port}';
 
-    // Cooldown check first (no socket close needed yet)
-    String printerKey = '${model.ipAddress}:${model.port}';
-    // Check if recently had a connection error and need to cool down
-    if (_lastConnectionAttempts.containsKey(printerKey)) {
-      DateTime lastAttempt = _lastConnectionAttempts[printerKey]!;
-      Duration timeSince = DateTime.now().difference(lastAttempt);
+    await _acquireLock(ip);
 
-      if (timeSince.inMilliseconds < _connectionCooldownMs) {
-        // Force a delay to avoid overwhelming the printer
-        int waitTime = _connectionCooldownMs - timeSince.inMilliseconds;
-        _log('Waiting ${waitTime}ms before reconnecting to $printerKey after previous error', level: 'info');
-        await Future.delayed(Duration(milliseconds: waitTime));
-      }
-    }
+    try {
+      // Check if recently had a connection error and need to cool down
+      await _applyCooldown(printerKey);
 
-    // Always ensure socket is closed before creating a new one
-    await _safeCloseSocket(printerIp: model.ipAddress);
+      // Close any existing socket for this IP before creating a new one
+      await _closeIpDedicatedSocket(ip);
 
-    int retryCount = 0;
-    SocketException? lastException;
-    StackTrace? lastStackTrace;
+      int retryCount = 0;
+      SocketException? lastException;
+      StackTrace? lastStackTrace;
 
-    while (retryCount < model.maxRetries) {
-      try {
-        socketsPerIp[model.ipAddress] = await Socket.connect(
-          model.ipAddress,
-          model.port,
-          timeout: model.timeout,
-        );
+      while (retryCount < model.maxRetries) {
+        try {
+          final newSocket = await Socket.connect(ip, model.port, timeout: model.timeout);
+          newSocket.setOption(SocketOption.tcpNoDelay, true);
+          _socketRegistry[ip] =
+              _SocketEntry(socket: newSocket, connectedAt: DateTime.now(), status: TCPStatus.connected);
 
-        _socketStatuses[model.ipAddress] = TCPStatus.connected;
+          // Success - remove from tracking
+          _lastConnectionAttempts.remove(printerKey);
 
-        // Success - remove from tracking
-        _lastConnectionAttempts.remove(printerKey);
+          // Add a small delay after connecting to ensure printer is ready
+          await Future.delayed(Duration(milliseconds: 100));
 
-        // Add a small delay after connecting to ensure printer is ready
-        await Future.delayed(Duration(milliseconds: 100));
+          return PrinterConnectStatusResult(isSuccess: true);
+        } catch (e, stackTrace) {
+          lastException = e is SocketException ? e : SocketException(e.toString());
+          lastStackTrace = stackTrace;
 
-        return PrinterConnectStatusResult(isSuccess: true);
-      } catch (e, stackTrace) {
-        lastException = e is SocketException ? e : SocketException(e.toString());
-        lastStackTrace = stackTrace;
+          // Track this failed attempt
+          _lastConnectionAttempts[printerKey] = DateTime.now();
 
-        // Track this failed attempt
-        _lastConnectionAttempts[printerKey] = DateTime.now();
+          _log('Connection attempt ${retryCount + 1} failed: $e', level: 'error', error: e, stackTrace: stackTrace);
 
-        _log('Connection attempt ${retryCount + 1} failed: $e', level: 'error', error: e, stackTrace: stackTrace);
-
-        if (retryCount < model.maxRetries - 1) {
-          // Add some jitter to retry delays to avoid connection storms
-          int jitter = (Random().nextInt(200) - 100); // -100ms to +100ms
-          int delay = (1000 * (1 << retryCount) + jitter).clamp(500, 5000);
-          await Future.delayed(Duration(milliseconds: delay));
+          if (retryCount < model.maxRetries - 1) {
+            // Add some jitter to retry delays to avoid connection storms
+            int jitter = (Random().nextInt(200) - 100); // -100ms to +100ms
+            int delay = (1000 * (1 << retryCount) + jitter).clamp(500, 5000);
+            await Future.delayed(Duration(milliseconds: delay));
+          }
+          retryCount++;
         }
-        retryCount++;
       }
+      return PrinterConnectStatusResult(
+        isSuccess: false,
+        exception: '$printerKey: ${lastException}',
+        stackTrace: lastStackTrace,
+      );
+    } finally {
+      _releaseLock(ip);
     }
-
-    _socketStatuses[model.ipAddress] = TCPStatus.none;
-    return PrinterConnectStatusResult(
-      isSuccess: false,
-      exception: '${model.ipAddress}:${model.port}: ${lastException}',
-      stackTrace: lastStackTrace,
-    );
   }
 
-  // Disconnect socket connection map to 1 printer (_sockets)
+  // Disconnect IP-dedicated-socket (_socketRegistry)
   @override
   Future<bool> disconnectDedicatedSocket({int? delayMs, required String printerIp}) async {
     try {
@@ -677,13 +831,12 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
       if (delayMs != null && delayMs > 0) {
         await Future.delayed(Duration(milliseconds: delayMs));
       }
-
-      await _safeCloseSocket(printerIp: printerIp);
-      _socketStatuses[printerIp] = TCPStatus.none;
+      await _acquireLock(printerIp);
+      await _closeIpDedicatedSocket(printerIp);
+      _releaseLock(printerIp);
       return true;
-    } catch (e) {
-      _log('$printerIp Error during disconnect: $e', level: 'error', error: e);
-      _socketStatuses[printerIp] = TCPStatus.none;
+    } catch (e, s) {
+      _log('$printerIp Error during disconnect: $e', level: 'error', error: e, stackTrace: s);
       return false;
     }
   }
@@ -757,9 +910,195 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
   // Clean up resources
   void dispose() {
     _safeCloseSocket();
-    for (final ip in socketsPerIp.keys) {
-      _safeCloseSocket(printerIp: ip);
-    }
+    disposeAllDedicatedSockets();
     _statusStreamController.close();
   }
+
+  Future<void> disposeAllDedicatedSockets({int? delayMs}) async {
+    // Wait before closing to allow queued commands to complete
+    if (delayMs != null && delayMs > 0) {
+      await Future.delayed(Duration(milliseconds: delayMs));
+    }
+    final ips = List<String>.from(_socketRegistry.keys);
+    for (final ip in ips) {
+      await _closeIpDedicatedSocket(ip);
+    }
+  }
+
+  /**
+   * IP-level lock — ensures only one operation runs per IP at a time
+   * Callers await _acquireLock, do their work, then call _releaseLock.
+   */
+  Future<void> _acquireLock(String ip) async {
+    while (_ipLocks.containsKey(ip)) {
+      await _ipLocks[ip]!.future;
+    }
+    _ipLocks[ip] = Completer<void>();
+  }
+
+  void _releaseLock(String ip) {
+    final completer = _ipLocks.remove(ip);
+    completer?.complete();
+  }
+
+  Future<void> _applyCooldown(String printerKey) async {
+    if (_lastConnectionAttempts.containsKey(printerKey)) {
+      DateTime lastAttempt = _lastConnectionAttempts[printerKey]!;
+      Duration timeSince = DateTime.now().difference(lastAttempt);
+
+      if (timeSince.inMilliseconds < _connectionCooldownMs) {
+        // Force a delay to avoid overwhelming the printer
+        int waitTime = _connectionCooldownMs - timeSince.inMilliseconds;
+        _log('Waiting ${waitTime}ms before reconnecting to $printerKey after previous error', level: 'info');
+        await Future.delayed(Duration(milliseconds: waitTime));
+      }
+    }
+  }
+
+  /**
+   * Safely close and remove a socket entry for the given IP.
+   * Always nullifies the registry entry first so no other caller can acquire the dangling socket reference.
+   */
+  Future<void> _closeIpDedicatedSocket(String ip) async {
+    final entry = _socketRegistry.remove(ip);
+    if (entry == null) return;
+    try {
+      await entry.socket.close().timeout(const Duration(milliseconds: 500));
+      _log('${ip} Socket closed successfully', level: 'info');
+    } catch (e, s) {
+      _log('${ip} Socket close() failed - cleanup handled by destroy()', level: 'error', error: e, stackTrace: s);
+    } finally {
+      try {
+        entry.socket.destroy();
+      } catch (e, s) {
+        _log('${ip} Socket destroy() failed', level: 'error', error: e, stackTrace: s);
+      }
+    }
+  }
+
+  /***
+   * Sends a chunk/section of data and handles socket error by throwing _SocketReconnectedException
+   * when a reconnect was needed, for caller to catch and handle a retry send
+   */
+  Future<void> _sendDataSection({
+    required Socket socket,
+    required TcpPrinterInput model,
+    required bool useDedicatedSocket,
+    required List<int> sectionData,
+    required int sectionIndex,
+  }) async {
+    var flushTimeout = const Duration(seconds: 2);
+    try {
+      socket.add(Uint8List.fromList(sectionData));
+    } catch (e, s) {
+      _log(
+          '${model.ipAddress}${useDedicatedSocket ? '' : ' (shared)'} socket.add() failed, sectionIndex:$sectionIndex. reconnecting',
+          level: 'warn');
+      final newSocket = await _reconnectSocket(model, useDedicatedSocket);
+      // Signal the send caller to restart with the new socket
+      throw _SocketReconnectedException(newSocket, sectionIndex: sectionIndex);
+    }
+
+    try {
+      await socket.flush().timeout(flushTimeout);
+    } on TimeoutException {
+      _log('${model.ipAddress} flush() timed out, sectionIndex:$sectionIndex. destroying socket${useDedicatedSocket ? ' (dedicated)' : ''}', level: 'warn');
+      socket.destroy();
+      if (useDedicatedSocket) {
+        _socketRegistry.remove(model.ipAddress);
+      } else {
+        _socket = null;
+      }
+      throw TimeoutException('[${model.ipAddress}] flush() timed out, printer may be busy${useDedicatedSocket ? ' (dedicated)' : ''}');
+    }
+  }
+
+  /**
+   * Closes current socket, opens a new one, returns it.
+   * Must be called while the IP lock is held (splitSend holds it).
+   */
+  Future<Socket> _reconnectSocket(TcpPrinterInput model, bool useDedicatedSocket) async {
+    assert(_ipLocks.containsKey(model.ipAddress),
+        '_reconnectSocket called without holding IP lock for ${model.ipAddress}');
+
+    final ip = model.ipAddress;
+    if (useDedicatedSocket) {
+      await _closeIpDedicatedSocket(ip);
+      final newSocket = await Socket.connect(ip, model.port, timeout: model.timeout);
+      newSocket.setOption(SocketOption.tcpNoDelay, true);
+      _socketRegistry[ip] = _SocketEntry(socket: newSocket, connectedAt: DateTime.now(), status: TCPStatus.connected);
+      await Future.delayed(const Duration(milliseconds: 300));
+      _log('$ip Reconnected (dedicated)', level: 'info');
+      return newSocket;
+    } else {
+      await _safeCloseSocket();
+      final socket = await Socket.connect(ip, model.port, timeout: model.timeout);
+      socket.setOption(SocketOption.tcpNoDelay, true);
+      _socket = socket;
+      status = TCPStatus.connected;
+      await Future.delayed(const Duration(milliseconds: 300));
+      _log('$ip Reconnected (shared)', level: 'info');
+      return socket;
+    }
+  }
+
+  int _calculateInterSectionDelay({
+    required int baseDelayMs,
+    required bool isImageBased,
+    required List<int> currentSection,
+    required int sectionIndex,
+    required int sectionCount,
+  }) {
+    if (isImageBased) {
+      // ── Image: reset section
+      // Fixed window for printer to complete initialisation before image data arrives
+      if (sectionIndex == 0) return baseDelayMs;
+
+      // ── Image: drain sentinel (empty section before cut)
+      // Gives printer time to finish physically printing the last image chunk
+      // before the cut command arrives.
+      // 150ms covers worst-case: ~12mm paper travel at 80mm/s (slowest printer tier)
+      if (currentSection.isEmpty && (sectionIndex == sectionCount - 2)) return 150;
+    }
+
+    // ── Image: stripe chunk / Text: command chunk
+    // Calculates print time from section byte size using worst-case print speed (80mm/s) — safe across all printer
+    // tiers since faster printers simply wait slightly longer than needed.
+    //
+    // Formula: printTimeMs = sectionBytes / (dotsPerMm × printSpeedMmPerMs)
+    //                      = sectionBytes / (8 × 0.080)
+    //                      = sectionBytes / 0.64
+    //                      ≈ sectionBytes * 10 / 6400   (integer arithmetic)
+    //
+    // Text sections over-estimate slightly since text renders from font ROM faster than raw pixel streaming — safe,
+    // not a correctness issue.
+    final int printTimeMs = (currentSection.length * 10) ~/ 6400;
+
+    // +20ms safety margin: covers TCP jitter, firmware processing overhead, and ensures buffer headroom
+    // before the next section arrives.
+    return (printTimeMs + 20).clamp(baseDelayMs, 300);
+  }
 }
+
+// Per-IP socket entry — owns the socket and its lifecycle state
+class _SocketEntry {
+  Socket socket;
+  TCPStatus status;
+  DateTime connectedAt;
+
+  _SocketEntry({
+    required this.socket,
+    required this.connectedAt,
+    this.status = TCPStatus.connected,
+  });
+}
+
+class _SocketReconnectedException {
+  final Socket newSocket;
+  final int sectionIndex; // which section was being sent
+
+  const _SocketReconnectedException(this.newSocket, {
+    required this.sectionIndex,
+  });
+}
+

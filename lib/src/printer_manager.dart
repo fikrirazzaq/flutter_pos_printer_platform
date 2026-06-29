@@ -179,10 +179,10 @@ class PrinterManager {
     } else if (type == PrinterType.usb && (Platform.isAndroid || Platform.isWindows)) {
       return await usbPrinterConnector.disconnect(delayMs: delayMs);
     } else {
-      if (dedicatedSocketIp != null && tcpPrinterConnector.socketsPerIp.containsKey(dedicatedSocketIp!)) {
-        return await tcpPrinterConnector.disconnectDedicatedSocket(printerIp: dedicatedSocketIp);
+      if (dedicatedSocketIp != null) {
+        return await tcpPrinterConnector.disconnectDedicatedSocket(printerIp: dedicatedSocketIp, delayMs: delayMs);
       } else {
-        return await tcpPrinterConnector.disconnect();
+        return await tcpPrinterConnector.disconnect(delayMs: delayMs);
       }
     }
   }
@@ -210,18 +210,31 @@ class PrinterManager {
     }
   }
 
-  Future<PrinterConnectStatusResult> splitSend(
-      {required PrinterType type,
-      required List<List<int>> bytes,
-      BasePrinterInput? model,
-      int delayBetweenMs = 50}) async {
+  Future<PrinterConnectStatusResult> splitSend({required PrinterType type,
+    required List<List<int>> bytes,
+    BasePrinterInput? model,
+    int delayBetweenMs = 50,
+    bool useSplitSendV2 = false,
+    bool queryStatusPreSend = false,
+    bool isImageBased = false,
+  }) async {
     if (type == PrinterType.bluetooth && (Platform.isIOS || Platform.isAndroid)) {
       return await bluetoothPrinterConnector.splitSend(bytes);
     } else if (type == PrinterType.usb && (Platform.isAndroid || Platform.isWindows)) {
       return await usbPrinterConnector.splitSend(bytes);
     } else {
-      return await tcpPrinterConnector.splitSend(bytes,
-          model: model as TcpPrinterInput?, delayBetweenMs: delayBetweenMs, useDedicatedSocket: useDedicatedSocket);
+      if (useSplitSendV2) {
+        return await tcpPrinterConnector.splitSendV2(bytes,
+          model: model as TcpPrinterInput?,
+          delayBetweenMs: delayBetweenMs,
+          useDedicatedSocket: useDedicatedSocket,
+          queryStatusPreSend: queryStatusPreSend,
+          isImageBased: isImageBased
+        );
+      } else {
+        return await tcpPrinterConnector.splitSend(bytes,
+            model: model as TcpPrinterInput?, delayBetweenMs: delayBetweenMs, useDedicatedSocket: useDedicatedSocket);
+      }
     }
   }
 
@@ -232,9 +245,11 @@ class PrinterManager {
       return await usbPrinterConnector.disconnect(delayMs: delayMs);
     } else {
       bool disconnected = false;
-      disconnected = await tcpPrinterConnector.disconnect();
-      for (final ip in tcpPrinterConnector.socketsPerIp.keys) {
-        disconnected = await tcpPrinterConnector.disconnectDedicatedSocket(printerIp: ip);
+      if (useDedicatedSocket) {
+        await tcpPrinterConnector.disposeAllDedicatedSockets(delayMs: delayMs);
+        disconnected = true;
+      } else {
+        disconnected = await tcpPrinterConnector.disconnect(delayMs: delayMs);
       }
       return disconnected;
     }

@@ -1,4 +1,5 @@
 import 'package:flutter/services.dart';
+import 'package:flutter_pos_printer_platform/src/helpers/printer_status_checker.dart';
 
 final flutterPrinterChannel = const MethodChannel('com.sersoluciones.flutter_pos_printer_platform');
 final flutterPrinterEventChannelBT = const EventChannel('com.sersoluciones.flutter_pos_printer_platform/bt_state');
@@ -19,6 +20,7 @@ enum PrinterHwStatus {
   coverOpen, // Printer reports cover open
   error, // Printer reports an error condition
   notResponding, // Status query sent but no response within timeout
+  feedBtnPressed,
 }
 
 class PrinterConnectStatusResult {
@@ -27,6 +29,7 @@ class PrinterConnectStatusResult {
   final StackTrace? stackTrace;
   final PrinterHwStatus printerStatus;
   final int? statusByte; // Raw status byte from printer for debugging
+  final PrinterQueryResult? queryResult;
 
   const PrinterConnectStatusResult({
     required this.isSuccess,
@@ -34,6 +37,7 @@ class PrinterConnectStatusResult {
     this.stackTrace,
     this.printerStatus = PrinterHwStatus.unknown,
     this.statusByte,
+    this.queryResult,
   });
 }
 
