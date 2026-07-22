@@ -82,7 +82,11 @@ class Generator {
         .replaceAll("•", '.')
         .replaceNonAscii();
     if (!isKanji) {
-      text = text.replaceNonPrintable(replaceWith: '');
+      // Keeps bytes 128-255 (accented Latin letters, currency symbols, etc.)
+      // instead of the old `replaceNonPrintable`, which silently deleted them
+      // even though `latin1.encode` below handles the full 0-255 range fine —
+      // see `replaceNonPrintableKeepLatin1` (P22-4885 Phase 9).
+      text = text.replaceNonPrintableKeepLatin1();
       return latin1.encode(text);
     } else {
       late List<int> encodedText;

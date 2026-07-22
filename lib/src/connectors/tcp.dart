@@ -34,6 +34,49 @@ class TcpPrinterInfo {
   });
 }
 
+/// Tunables for feed-distance-based print pacing. Defaults are conservative
+/// (worst-case cheap-printer values) so pacing is safe on the slowest supported
+/// hardware; a caller may replace [TcpPrinterConnector.pacing] with faster
+/// values derived from a known printer's capability profile.
+class TcpPacingConfig {
+  final double printSpeedMmPerMs; // 0.08 = 80 mm/s (slowest tier)
+  final int dotsPerMm; // 8 = 203 dpi
+  final int textLineHeightDots; // per-line feed distance for text sections
+
+  /// Time to hold the socket/lock after a receipt's cut command before the
+  /// NEXT receipt is allowed to start on this IP, covering the autocutter's
+  /// mechanical cut-and-retract cycle.
+  ///
+  /// This was briefly raised to 1800ms while investigating a RONGTA WiFi
+  /// jam under a 22+ receipt burst, on a theory that the cutter needed more
+  /// recovery time. That theory was WRONG and the raise did not fix the jam
+  /// — the real causes were three socket-layer defects (always-reconnect
+  /// defeating socket reuse, `.listen()` on a reused single-subscription
+  /// socket, and a too-short flush timeout; all P22-4885). With those
+  /// fixed, the 1800ms was pure overhead: it accounted for ~53% of every
+  /// kitchen receipt's wall time. Reverted to the researched 500ms.
+  final int autocutterMechanicalMs;
+
+  final int minInterSectionMs; // floor between sections
+
+  /// Per-section margin added on top of the pure feed-distance estimate, to
+  /// cover firmware command-parsing and WiFi round-trip latency a
+  /// distance-only model doesn't capture. Also briefly raised (20→35) on the
+  /// same wrong cutter theory above; reverted. This is a per-section fixed
+  /// cost, so it is multiplied by section count — on a 74-section customer
+  /// receipt each extra 15ms cost >1s of wall time for no benefit.
+  final int safetyMarginMs;
+
+  const TcpPacingConfig({
+    this.printSpeedMmPerMs = 0.08,
+    this.dotsPerMm = 8,
+    this.textLineHeightDots = 32,
+    this.autocutterMechanicalMs = 500,
+    this.minInterSectionMs = 30,
+    this.safetyMarginMs = 20,
+  });
+}
+
 class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
   TcpPrinterConnector._();
 
@@ -47,6 +90,25 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
   TCPStatus _status = TCPStatus.none;
   final Map<String, DateTime> _lastConnectionAttempts = {};
   final int _connectionCooldownMs = 2000; // 2 seconds cooldown between connection attempts
+
+  // Cached broadcast-stream wrapper for the SHARED (_socket) path, mirroring
+  // _SocketEntry.byteStream — see its doc comment. Identity-keyed so it's
+  // only rewrapped when _socket is actually a different instance (a raw
+  // Socket can only be wrapped/listened to once).
+  Socket? _sharedByteStreamSocket;
+  Stream<Uint8List>? _sharedByteStream;
+
+  Stream<Uint8List> _byteStreamFor(Socket socket) {
+    if (!identical(_sharedByteStreamSocket, socket)) {
+      _sharedByteStreamSocket = socket;
+      _sharedByteStream = socket.asBroadcastStream();
+    }
+    return _sharedByteStream!;
+  }
+
+  /// Feed-distance pacing tunables (see [TcpPacingConfig]). Conservative
+  /// defaults; can be swapped for profile-derived values per printer tier.
+  static TcpPacingConfig pacing = const TcpPacingConfig();
 
   final StreamController<TCPStatus> _statusStreamController = StreamController.broadcast();
 
@@ -85,6 +147,14 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
 
   // Primary registry: IP → socket entry
   final Map<String, _SocketEntry> _socketRegistry = {};
+
+  // IPs whose previous receipt aborted mid-send. The next receipt to such an IP
+  // prepends a defensive cut so any partial slip left buffered in the printer is
+  // severed onto its own paper instead of merging with the new receipt.
+  final Set<String> _abortedIps = {};
+
+  // ESC d 3 (feed 3 lines) + GS V 0 (full cut) — the defensive cut above.
+  static const List<int> _defensiveCut = [0x1B, 0x64, 0x03, 0x1D, 0x56, 0x00];
 
   // Connect to printers using shared socket (_socket)
   @override
@@ -172,6 +242,12 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     if (!connectionStatus.isSuccess) return connectionStatus;
 
     final ip = model.ipAddress;
+    // Serialize writes per IP so a plain send() cannot interleave with a
+    // concurrent splitSend/splitSendV2 on the same socket — an interleaved
+    // write corrupts an in-flight receipt (scrambled/merged output). Acquired
+    // AFTER _checkConnectionStatus because connectDedicatedSocket() also takes
+    // this lock and _acquireLock is not reentrant.
+    await _acquireLock(ip);
     try {
       final socket = useDedicatedSocket ? _socketRegistry[ip]?.socket : _socket;
       if (socket == null) {
@@ -196,6 +272,8 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
           stackTrace: stackTrace,
         );
       }
+    } finally {
+      _releaseLock(ip);
     }
   }
 
@@ -222,52 +300,61 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     SocketException? lastException;
     StackTrace? lastStackTrace;
 
-    while (retryCount < maxRetries) {
-      try {
-        // Check printer status
-        String printerKey = '${model?.ipAddress}:9100';
-        bool printerReady = await PrinterStatusChecker.checkStatus(
-          _socket!, printerKey,
-          maxRetries: 2, // Less retries for status check within send retry loop
-          retryDelay: Duration(milliseconds: 200),
-        );
+    // Serialize the whole retry/write loop per IP so it cannot interleave with
+    // a concurrent splitSend on the same shared socket. connect() (shared) does
+    // not take this lock, so reconnecting inside the loop won't deadlock.
+    final ip = model?.ipAddress;
+    if (ip != null) await _acquireLock(ip);
+    try {
+      while (retryCount < maxRetries) {
+        try {
+          // Check printer status
+          String printerKey = '${model?.ipAddress}:9100';
+          bool printerReady = await PrinterStatusChecker.checkStatus(
+            _socket!, printerKey,
+            maxRetries: 2, // Less retries for status check within send retry loop
+            retryDelay: Duration(milliseconds: 200),
+          );
 
-        if (!printerReady) {
-          throw SocketException('Printer not ready or in error state');
-        }
+          if (!printerReady) {
+            throw SocketException('Printer not ready or in error state');
+          }
 
-        // Send data
-        _socket!.add(Uint8List.fromList(bytes));
-        await _socket!.flush();
+          // Send data
+          _socket!.add(Uint8List.fromList(bytes));
+          await _socket!.flush();
 
-        return PrinterConnectStatusResult(isSuccess: true);
-      } catch (e, stackTrace) {
-        lastException = e is SocketException ? e : SocketException(e.toString());
-        lastStackTrace = stackTrace;
+          return PrinterConnectStatusResult(isSuccess: true);
+        } catch (e, stackTrace) {
+          lastException = e is SocketException ? e : SocketException(e.toString());
+          lastStackTrace = stackTrace;
 
-        _log('Print attempt ${retryCount + 1} failed: $e');
+          _log('Print attempt ${retryCount + 1} failed: $e');
 
-        retryCount++;
-        if (retryCount < maxRetries) {
-          await Future.delayed(retryDelay);
+          retryCount++;
+          if (retryCount < maxRetries) {
+            await Future.delayed(retryDelay);
 
-          // Try to reconnect if needed
-          if (!isConnected && model != null) {
-            final reconnectResult = await connect(model);
-            if (!reconnectResult.isSuccess) {
-              continue;
+            // Try to reconnect if needed
+            if (!isConnected && model != null) {
+              final reconnectResult = await connect(model);
+              if (!reconnectResult.isSuccess) {
+                continue;
+              }
             }
           }
         }
       }
-    }
 
-    status = TCPStatus.none;
-    return PrinterConnectStatusResult(
-      isSuccess: false,
-      exception: 'Send error after $maxRetries attempts: ${lastException?.message}',
-      stackTrace: lastStackTrace,
-    );
+      status = TCPStatus.none;
+      return PrinterConnectStatusResult(
+        isSuccess: false,
+        exception: 'Send error after $maxRetries attempts: ${lastException?.message}',
+        stackTrace: lastStackTrace,
+      );
+    } finally {
+      if (ip != null) _releaseLock(ip);
+    }
   }
 
   @override
@@ -567,7 +654,12 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
       PrinterQueryResult? queryResult;
       if (queryStatusPreSend) {
         queryResult =
-            await PrinterStatusChecker.queryPrinterStatus(socket, '${model.ipAddress}:${model.port}', cacheTtl: 5);
+            await PrinterStatusChecker.queryPrinterStatus(
+          socket,
+          useDedicatedSocket ? _socketRegistry[ip]!.byteStream : _byteStreamFor(socket),
+          '${model.ipAddress}:${model.port}',
+          cacheTtl: 5,
+        );
         if (queryResult.hwCondition != PrinterHwStatus.ready) {
           return PrinterConnectStatusResult(
             isSuccess: false,
@@ -578,6 +670,23 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         }
       }
 
+      // Defensive cut: if the previous receipt to this IP aborted mid-send, its
+      // partial bytes may still sit in the printer's buffer (ESC @ does not
+      // clear it). Sever them onto their own slip before this receipt's content
+      // so the two never merge (overlap / header-in-wrong-receipt / mid cut).
+      // Done only after a real abort, and only once the printer checked ready.
+      if (_abortedIps.remove(ip)) {
+        _log('$ip prior receipt aborted — prepending defensive cut', level: 'warn');
+        await _sendDataSection(
+          socket: socket,
+          model: model,
+          useDedicatedSocket: useDedicatedSocket,
+          sectionData: _defensiveCut,
+          sectionIndex: -1,
+        );
+        await Future.delayed(Duration(milliseconds: pacing.autocutterMechanicalMs));
+      }
+
       int totalSize = bytes.fold(0, (sum, section) => sum + section.length);
       _log(
           '2. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} sending ${bytes.length} sections, total size: $totalSize bytes');
@@ -585,39 +694,18 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
       for (int i = 0; i < bytes.length; i++) {
         final sectionData = bytes[i];
         if (sectionData.isNotEmpty) {
-          const int maxSendAttempts = 2;
-          int attempt = 1;
-
-          sendAttempt:
-          while (attempt <= maxSendAttempts) {
-            try {
-              await _sendDataSection(
-                socket: socket!,
-                model: model,
-                useDedicatedSocket: useDedicatedSocket,
-                sectionData: sectionData,
-                sectionIndex: i,
-              );
-              // no issue on first attempt, exit from while scope
-              break sendAttempt;
-            } on _SocketReconnectedException catch (e) {
-              // socket is reconnected & replaced mid-send, retry with new socketConnection
-              socket = e.newSocket;
-              // Short pause to let printer settle after new connection
-              await Future.delayed(const Duration(milliseconds: 300));
-              if ((attempt + 1) == maxSendAttempts || (isImageBased && i > 0)) {
-                // If 2nd attempt failed, hand-off to outer catch.
-                // OR if image receipt (split by image stripe) & failure occurs on content section, fail completely. Hand-off to outer catch.
-                rethrow;
-              } else {
-                // trigger next send attempt
-                attempt++;
-                _log('$ip${useDedicatedSocket ? '' : ' (shared)'} socket replaced when sending section:$i, retry send #$attempt', level: 'warn');
-              }
-            } catch (e, s) {
-              rethrow; // handle by outer catch
-            }
-          }
+          // Single attempt per section — never re-send a section that may have
+          // been partially written (that duplicated bytes → overlap/garble).
+          // Any mid-receipt socket error is fatal for the whole receipt: it
+          // propagates to the outer catch (which destroys the socket) and the
+          // bloc re-sends the ENTIRE receipt from the start (atomic retry).
+          await _sendDataSection(
+            socket: socket,
+            model: model,
+            useDedicatedSocket: useDedicatedSocket,
+            sectionData: sectionData,
+            sectionIndex: i,
+          );
         }
 
         _log(
@@ -626,11 +714,8 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         // Apply inter-section delay
         if (i < bytes.length - 1) {
           final delayAfterSection = _calculateInterSectionDelay(
-            baseDelayMs: 50,
             isImageBased: isImageBased,
             currentSection: sectionData,
-            sectionIndex: i,
-            sectionCount: bytes.length,
           );
           _log(
               '3.1. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Sent section:$i ${sectionData.length} bytes, delay $delayAfterSection',
@@ -639,15 +724,26 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         }
       }
 
-      // Give printer time to process before returning
-      await Future.delayed(Duration(milliseconds: 200));
+      // End-of-receipt drain: wait for the final section (cut + trailing feed)
+      // to physically print and the autocutter to fire before releasing the
+      // socket/lock. Otherwise the next receipt on this IP can begin while the
+      // cut is still mid-travel → mid-receipt cut / overlap under burst.
+      final drainMs = bytes.isNotEmpty
+          ? _endOfReceiptDrainMs(bytes.last, isImageBased)
+          : pacing.autocutterMechanicalMs;
+      await Future.delayed(Duration(milliseconds: drainMs));
 
       _log('4. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Successfully sent all ${bytes.length} print sections',
           level: 'warn');
 
       if (!queryStatusPreSend && socket != null) {
         queryResult =
-            await PrinterStatusChecker.queryPrinterStatus(socket, '${model.ipAddress}:${model.port}', cacheTtl: 5);
+            await PrinterStatusChecker.queryPrinterStatus(
+          socket,
+          useDedicatedSocket ? _socketRegistry[ip]!.byteStream : _byteStreamFor(socket),
+          '${model.ipAddress}:${model.port}',
+          cacheTtl: 5,
+        );
       }
 
       return PrinterConnectStatusResult(
@@ -671,6 +767,9 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         status = TCPStatus.none;
         await _safeCloseSocket();
       }
+      // Flag this IP so the next receipt prepends a defensive cut to sever any
+      // partial slip this aborted receipt may have left buffered in the printer.
+      _abortedIps.add(ip);
       return PrinterConnectStatusResult(
         isSuccess: false,
         exception: 'splitSendV2 error $ip${useDedicatedSocket ? '' : ' (shared)'}: $e',
@@ -771,6 +870,36 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     await _acquireLock(ip);
 
     try {
+      // Reuse a socket that's already open and live for this IP instead of
+      // always tearing it down and reconnecting. This method is called at
+      // the START of every print job (print_bloc.dart's _printReceipt calls
+      // printerManager.connect() unconditionally, before splitSend), so
+      // until now EVERY job forced a fresh TCP handshake here regardless of
+      // worker mode's intent to keep one dedicated socket open across
+      // successful jobs — silently defeating that design (P22-4885): the
+      // "keep-socket-open so the printer's own TCP backpressure paces the
+      // stream" architecture never actually took effect, because the socket
+      // was destroyed and rebuilt right here before every single send. That
+      // forces repeated connect/disconnect churn cheap WiFi-to-serial
+      // printer modules (RONGTA) are known to handle poorly under sustained
+      // back-to-back load — a very plausible contributor to jams under a
+      // large multi-receipt burst that this reuse restores the pacing
+      // benefit for.
+      final existing = _socketRegistry[ip];
+      if (existing != null && existing.status == TCPStatus.connected) {
+        try {
+          // Cheap local liveness probe (same pattern splitSendV2 uses):
+          // throws only if the socket object itself was already closed/
+          // destroyed locally, not a true end-to-end check.
+          existing.socket.setOption(SocketOption.tcpNoDelay, true);
+          _log('$ip reusing existing dedicated socket (skip reconnect)', level: 'info');
+          return PrinterConnectStatusResult(isSuccess: true);
+        } catch (_) {
+          _log('$ip existing dedicated socket is dead — reconnecting', level: 'warn');
+          await _closeIpDedicatedSocket(ip);
+        }
+      }
+
       // Check if recently had a connection error and need to cool down
       await _applyCooldown(printerKey);
 
@@ -977,8 +1106,11 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
   }
 
   /***
-   * Sends a chunk/section of data and handles socket error by throwing _SocketReconnectedException
-   * when a reconnect was needed, for caller to catch and handle a retry send
+   * Sends one section of a receipt. On ANY socket error (add failure or flush
+   * timeout) it destroys the socket and throws — the error is fatal for the
+   * whole receipt. It never reconnects or resends mid-receipt (that duplicated
+   * already-written bytes); the bloc re-sends the entire receipt on a fresh
+   * socket instead.
    */
   Future<void> _sendDataSection({
     required Socket socket,
@@ -987,16 +1119,38 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     required List<int> sectionData,
     required int sectionIndex,
   }) async {
-    var flushTimeout = const Duration(seconds: 2);
+    // flush() blocking is the intended TCP-backpressure signal that a slow,
+    // small-buffer printer (RONGTA) is still draining what we already sent.
+    // It is NOT evidence the connection is dead, and the bytes are not lost
+    // — they sit in the kernel send buffer and will be delivered once the
+    // printer's receive window reopens. Destroying the socket here throws
+    // that in-flight data away and forces a whole-receipt atomic retry,
+    // which under load makes things strictly worse: the retry's fresh flood
+    // lands on a printer still working through the previous attempt.
+    //
+    // Field data (P22-4885, RONGTA, 22+ receipt burst): at 2s this tripped
+    // constantly; at 8s it still tripped ~once per run, each time costing a
+    // ~11s stall AND a duplicate send of the entire receipt. Ordinary
+    // congestion must never be fatal — so this is set well above any
+    // plausible backpressure stall. It exists only to catch a genuinely
+    // dead link; the bloc's 60s per-job watchdog is the real backstop for a
+    // wedged printer (it tears the socket down and applies capped retry).
+    var flushTimeout = const Duration(seconds: 30);
     try {
       socket.add(Uint8List.fromList(sectionData));
-    } catch (e, s) {
+    } catch (e) {
+      // Fatal: the socket broke mid-receipt. Destroy it and abort the whole
+      // receipt (no reconnect, no resume, no resend).
       _log(
-          '${model.ipAddress}${useDedicatedSocket ? '' : ' (shared)'} socket.add() failed, sectionIndex:$sectionIndex. reconnecting',
+          '${model.ipAddress}${useDedicatedSocket ? '' : ' (shared)'} socket.add() failed, sectionIndex:$sectionIndex. aborting receipt',
           level: 'warn');
-      final newSocket = await _reconnectSocket(model, useDedicatedSocket);
-      // Signal the send caller to restart with the new socket
-      throw _SocketReconnectedException(newSocket, sectionIndex: sectionIndex);
+      socket.destroy();
+      if (useDedicatedSocket) {
+        _socketRegistry.remove(model.ipAddress);
+      } else {
+        _socket = null;
+      }
+      throw SocketException('[${model.ipAddress}] socket.add() failed at section $sectionIndex: $e');
     }
 
     try {
@@ -1042,41 +1196,56 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     }
   }
 
+  /// Inter-section pacing based on the physical **feed distance** of the section
+  /// just sent, not its raw byte count. Raster bytes are not proportional to
+  /// paper feed (an ESC * stripe packs 3 bytes/column × 24 dot-rows), so the old
+  /// byte formula massively under-paced large images and let small-buffer
+  /// printers overflow (dropped/garbled bytes). We estimate feed dots → mm → ms
+  /// at the worst-case print speed, with NO upper clamp so large receipts pace
+  /// out fully. Combined with buffer-aware chunk sizes, the printer's receive
+  /// buffer never accumulates more than ~one section of un-printed data.
   int _calculateInterSectionDelay({
-    required int baseDelayMs,
     required bool isImageBased,
     required List<int> currentSection,
-    required int sectionIndex,
-    required int sectionCount,
   }) {
+    if (currentSection.isEmpty) return pacing.minInterSectionMs;
+    return _sectionPrintMs(currentSection, isImageBased) + pacing.safetyMarginMs;
+  }
+
+  /// Estimated milliseconds for the printer to physically render [section].
+  int _sectionPrintMs(List<int> section, bool isImageBased) {
+    final cfg = pacing;
+    final feedDots = _estimateFeedDots(section, isImageBased);
+    if (feedDots <= 0) return cfg.minInterSectionMs;
+    final feedMm = feedDots / cfg.dotsPerMm;
+    return max((feedMm / cfg.printSpeedMmPerMs).ceil(), cfg.minInterSectionMs);
+  }
+
+  /// Physical feed distance of a section, in printer dots. For raster, counts
+  /// ESC * (0x1B 0x2A) stripe commands (each = 24 dot-rows) — robust and does
+  /// not need the paper width. For text (or raster command-only sections),
+  /// counts LF (0x0A) line feeds × line height.
+  int _estimateFeedDots(List<int> section, bool isImageBased) {
     if (isImageBased) {
-      // ── Image: reset section
-      // Fixed window for printer to complete initialisation before image data arrives
-      if (sectionIndex == 0) return baseDelayMs;
-
-      // ── Image: drain sentinel (empty section before cut)
-      // Gives printer time to finish physically printing the last image chunk
-      // before the cut command arrives.
-      // 150ms covers worst-case: ~12mm paper travel at 80mm/s (slowest printer tier)
-      if (currentSection.isEmpty && (sectionIndex == sectionCount - 2)) return 150;
+      var stripes = 0;
+      for (var i = 0; i < section.length - 1; i++) {
+        if (section[i] == 0x1B && section[i + 1] == 0x2A) stripes++;
+      }
+      if (stripes > 0) return stripes * 24;
     }
+    var lineFeeds = 0;
+    for (final b in section) {
+      if (b == 0x0A) lineFeeds++;
+    }
+    return lineFeeds * pacing.textLineHeightDots;
+  }
 
-    // ── Image: stripe chunk / Text: command chunk
-    // Calculates print time from section byte size using worst-case print speed (80mm/s) — safe across all printer
-    // tiers since faster printers simply wait slightly longer than needed.
-    //
-    // Formula: printTimeMs = sectionBytes / (dotsPerMm × printSpeedMmPerMs)
-    //                      = sectionBytes / (8 × 0.080)
-    //                      = sectionBytes / 0.64
-    //                      ≈ sectionBytes * 10 / 6400   (integer arithmetic)
-    //
-    // Text sections over-estimate slightly since text renders from font ROM faster than raw pixel streaming — safe,
-    // not a correctness issue.
-    final int printTimeMs = (currentSection.length * 10) ~/ 6400;
-
-    // +20ms safety margin: covers TCP jitter, firmware processing overhead, and ensures buffer headroom
-    // before the next section arrives.
-    return (printTimeMs + 20).clamp(baseDelayMs, 300);
+  /// End-of-receipt drain: time for the final section (cut + trailing feed) to
+  /// physically print PLUS the autocutter's mechanical time, so the paper is
+  /// fully advanced and cut before the socket/lock is released and the next
+  /// receipt (possibly from another virtual printer on this IP) can begin.
+  int _endOfReceiptDrainMs(List<int> lastSection, bool isImageBased) {
+    return _sectionPrintMs(lastSection, isImageBased) + pacing.autocutterMechanicalMs;
   }
 }
 
@@ -1086,19 +1255,23 @@ class _SocketEntry {
   TCPStatus status;
   DateTime connectedAt;
 
+  /// A raw `Socket` is a single-subscription stream: calling `.listen()` on
+  /// it more than once ever throws "Bad state: Stream has already been
+  /// listened to." `PrinterStatusChecker` calls `.listen()` fresh on every
+  /// status query — harmless while every job got a brand-new socket, but
+  /// once the socket started being REUSED across jobs (P22-4885), the
+  /// second query on a reused socket crashed the whole receipt, which then
+  /// auto-retried and printed a defensive-cut blank strip ahead of the
+  /// retried content. Wrapping once, here, in a broadcast stream (which
+  /// *does* support repeated listen/cancel cycles) fixes it for this
+  /// socket's entire reused lifetime — a fresh entry (and fresh wrap) is
+  /// only created when a real reconnect happens.
+  late final Stream<Uint8List> byteStream = socket.asBroadcastStream();
+
   _SocketEntry({
     required this.socket,
     required this.connectedAt,
     this.status = TCPStatus.connected,
-  });
-}
-
-class _SocketReconnectedException {
-  final Socket newSocket;
-  final int sectionIndex; // which section was being sent
-
-  const _SocketReconnectedException(this.newSocket, {
-    required this.sectionIndex,
   });
 }
 

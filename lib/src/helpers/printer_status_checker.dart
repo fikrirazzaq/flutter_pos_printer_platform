@@ -252,7 +252,18 @@ class PrinterStatusChecker {
     ),
   ];
 
-  static Future<PrinterQueryResult> queryPrinterStatus(Socket socket, String printerKey, {int? cacheTtl}) async {
+  /// [byteStream] must be a broadcast-stream wrapper of [socket]'s incoming
+  /// bytes (e.g. `socket.asBroadcastStream()`, cached and reused for the
+  /// socket's whole lifetime by the caller — see `TcpPrinterConnector`'s
+  /// `_SocketEntry.byteStream`). A raw `Socket` is single-subscription: once
+  /// something calls `.listen()` on it, listening again ever — even after
+  /// canceling — throws "Bad state: Stream has already been listened to."
+  /// This function used to call `socket.listen()` directly each time, which
+  /// was fine only because every job got a brand-new socket; once sockets
+  /// started being reused across jobs (P22-4885), the second status query
+  /// on a reused socket crashed the whole receipt.
+  static Future<PrinterQueryResult> queryPrinterStatus(
+      Socket socket, Stream<Uint8List> byteStream, String printerKey, {int? cacheTtl}) async {
     final cached = _queryResultCache[printerKey];
 
     if (cached != null) {
@@ -261,20 +272,22 @@ class PrinterStatusChecker {
         return cached;
       } else {
         debugPrint('${printerKey} (queryPrinterStatus) ${DateTime.now()} _queryUsingProfile ${cached.toString()}');
-        return await _queryUsingProfile(socket, printerKey, cached);
+        return await _queryUsingProfile(socket, byteStream, printerKey, cached);
       }
     }
 
-    return await _probeAndBuildProfile(socket, printerKey);
+    return await _probeAndBuildProfile(socket, byteStream, printerKey);
   }
 
-  static Future<PrinterQueryResult> _probeAndBuildProfile(Socket socket, String printerKey) async {
+  static Future<PrinterQueryResult> _probeAndBuildProfile(Socket socket, Stream<Uint8List> byteStream, String printerKey) async {
     final profile = PrinterQueryResult();
 
-    // Single listener for the entire probe session
-    // Socket is a single-subscription stream, mutiple listen calls would throw "Bad State: stream already listened"
+    // Single listener for the entire probe session, sourced from the
+    // caller's persistent broadcast wrapper (see the [byteStream] doc above)
+    // so this can run again later on the same (reused) socket without
+    // hitting "stream already listened to".
     final responseStream = StreamController<int>.broadcast();
-    final sub = socket.listen(
+    final sub = byteStream.listen(
       (data) {
         for (final byte in data) {
           responseStream.add(byte);
@@ -292,7 +305,7 @@ class PrinterStatusChecker {
         for (final command in candidates) {
           debugPrint(
               '${printerKey} (queryPrinterStatus) _probeAndBuildProfile -> _getStatusResponse ${statusType.name} ${command.priority} ${command.bytes.toHex()}..');
-          final response = await _getStatusResponse(socket, responseStream.stream, command.bytes);
+          final response = await _getValidatedStatusResponse(socket, responseStream.stream, command.bytes);
           await Future.delayed(const Duration(milliseconds: 30)); // let buffer settle
           if (response != null) {
             // This command works for this printer — cache it
@@ -328,18 +341,37 @@ class PrinterStatusChecker {
       await responseStream.close();
     }
 
+    _updateResponsiveness(profile);
     profile.lastQueried = DateTime.now();
     _queryResultCache.putIfAbsent(printerKey, () => profile);
     return profile;
   }
 
-  static Future<PrinterQueryResult> _queryUsingProfile(
-      Socket socket, String printerKey, PrinterQueryResult profile) async {
+  /// Tracks whether THIS round got a genuine response for any status type,
+  /// and maintains [PrinterQueryResult.hasEverResponded] /
+  /// [PrinterQueryResult.consecutiveMisses] — the state [hwCondition] uses to
+  /// tell "this printer never supports status queries" (assume-ready is the
+  /// only sane default) apart from "this printer used to answer and has gone
+  /// silent" (a real fault: offline, unplugged, wedged buffer).
+  static void _updateResponsiveness(PrinterQueryResult profile) {
+    final respondedThisRound = profile.coverStatus != PrinterHwStatus.unknown ||
+        profile.paperStatus != PrinterHwStatus.unknown ||
+        profile.errorStatus != PrinterHwStatus.unknown;
+    if (respondedThisRound) {
+      profile.hasEverResponded = true;
+      profile.consecutiveMisses = 0;
+    } else {
+      profile.consecutiveMisses++;
+    }
+  }
 
-    // Single listener for the entire check
-    // Socket is a single-subscription stream, mutiple listen calls would throw "Bad State: stream already listened"
+  static Future<PrinterQueryResult> _queryUsingProfile(
+      Socket socket, Stream<Uint8List> byteStream, String printerKey, PrinterQueryResult profile) async {
+
+    // Single listener for the entire check, sourced from the caller's
+    // persistent broadcast wrapper — see [queryPrinterStatus]'s doc comment.
     final responseStream = StreamController<int>.broadcast();
-    final sub = socket.listen(
+    final sub = byteStream.listen(
       (data) {
         for (final byte in data) {
           responseStream.add(byte);
@@ -356,7 +388,7 @@ class PrinterStatusChecker {
         debugPrint(
             '${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse cover ${profile.coverCommand!
                 .priority} ${profile.coverCommand!.bytes.toHex()}..');
-        final response = await _getStatusResponse(socket, responseStream.stream, profile.coverCommand!.bytes);
+        final response = await _getValidatedStatusResponse(socket, responseStream.stream, profile.coverCommand!.bytes);
         if (response != null) {
           profile.coverLastBytes = response;
           profile.coverStatus = _decodeStatusResponse(profile.coverCommand!, response);
@@ -386,7 +418,7 @@ class PrinterStatusChecker {
             '${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse paper ${profile.paperCommand!
                 .priority} ${profile.paperCommand!.bytes.toHex()}..');
         await Future.delayed(const Duration(milliseconds: 30)); // let buffer settle
-        final response = await _getStatusResponse(socket, responseStream.stream, profile.paperCommand!.bytes);
+        final response = await _getValidatedStatusResponse(socket, responseStream.stream, profile.paperCommand!.bytes);
         if (response != null) {
           profile.paperLastBytes = response;
           profile.paperStatus = _decodeStatusResponse(profile.paperCommand!, response);
@@ -415,7 +447,7 @@ class PrinterStatusChecker {
             '${printerKey} (queryPrinterStatus) _queryUsingProfile -> _getStatusResponse errorstate ${profile
                 .errorCommand!.priority} ${profile.errorCommand!.bytes.toHex()}..');
         await Future.delayed(const Duration(milliseconds: 30)); // let buffer settle
-        final response = await _getStatusResponse(socket, responseStream.stream, profile.errorCommand!.bytes);
+        final response = await _getValidatedStatusResponse(socket, responseStream.stream, profile.errorCommand!.bytes);
         if (response != null) {
           profile.errorLastBytes = response;
           profile.errorStatus = _decodeStatusResponse(profile.errorCommand!, response);
@@ -446,6 +478,7 @@ class PrinterStatusChecker {
       await responseStream.close();
     }
 
+    _updateResponsiveness(profile);
     profile.lastQueried = DateTime.now();
     _queryResultCache[printerKey] = profile;
 
@@ -464,13 +497,49 @@ class PrinterStatusChecker {
       debugPrint(
           '${printerKey} (queryPrinterStatus) _reDiscoverPrinterProfile -> _getStatusResponse ${type.name} ${command
               .priority} ${command.bytes.toHex()}..');
-      final response = await _getStatusResponse(socket, responseStream.stream, command.bytes);
+      final response = await _getValidatedStatusResponse(socket, responseStream.stream, command.bytes);
       await Future.delayed(const Duration(milliseconds: 30)); // let buffer settle
       if (response != null) {
         return (command, response);
       }
     }
     return (null, null);
+  }
+
+  /// Real-time status reply bytes (DLE EOT n, n=1..4) carry vendor-fixed bits
+  /// per the ESC/POS spec, constant across all four sub-commands: bit0=0,
+  /// bit1=1, bit4=0, bit7=0. A byte that violates this is not a genuine
+  /// status reply — most likely a stray byte still sitting in the socket's
+  /// receive buffer from a previous send (see RC-1/RC-2 buffer-overflow /
+  /// socket-reuse corruption) — and must not be decoded as real hardware
+  /// status, or a corrupted byte could be misread as "printer ready".
+  static bool _isDleEotCommand(List<int> command) =>
+      listEquals(command, dleEot1) ||
+      listEquals(command, dleEot2) ||
+      listEquals(command, dleEot3) ||
+      listEquals(command, dleEot4);
+
+  static bool _isGenuineResponse(List<int> command, int response) {
+    if (!_isDleEotCommand(command)) return true; // no fixed-bit spec to check
+    return (response & 0x01) == 0x00 &&
+        (response & 0x02) == 0x02 &&
+        (response & 0x10) == 0x00 &&
+        (response & 0x80) == 0x00;
+  }
+
+  /// Wraps [_getStatusResponse], discarding replies that fail the fixed-bit
+  /// check so callers never treat a non-genuine byte as a real status.
+  static Future<int?> _getValidatedStatusResponse(
+      Socket socket, Stream<int> byteStream, List<int> command) async {
+    final response = await _getStatusResponse(socket, byteStream, command);
+    if (response == null) return null;
+    if (!_isGenuineResponse(command, response)) {
+      debugPrint(
+          '(queryPrinterStatus) discarded non-genuine reply for ${command.toHex()}: '
+          '0x${response.toRadixString(16).padLeft(2, '0')} (fixed-bit check failed)');
+      return null;
+    }
+    return response;
   }
 
   static Future<int?> _getStatusResponse(Socket socket, Stream<int> byteStream, List<int> command) async {
@@ -587,6 +656,23 @@ class PrinterQueryResult {
   /// Timestamp of last successful query — used for TTL check
   DateTime? lastQueried;
 
+  /// True once this printer key has EVER produced a genuine response to any
+  /// status command, across the life of this cached profile. Distinguishes
+  /// hardware that is genuinely status-less (no ASB / DLE EOT support —
+  /// RONGTA-style, where all-unknown is normal and assume-ready is correct)
+  /// from a printer that used to answer and has gone silent (offline,
+  /// unplugged, wedged buffer — a real fault [[RC-4]]).
+  bool hasEverResponded = false;
+
+  /// Consecutive query rounds with zero genuine responses across cover/
+  /// paper/error. Anti-flap: one missed poll (a transient blip) must not
+  /// flip a healthy, previously-responsive printer to [PrinterHwStatus.notResponding].
+  int consecutiveMisses = 0;
+
+  /// Number of consecutive silent rounds required, for a printer that has
+  /// responded before, before [hwCondition] reports [PrinterHwStatus.notResponding].
+  static const int consecutiveMissThreshold = 2;
+
   PrinterQueryResult({
     this.coverCommand,
     this.coverStatus = PrinterHwStatus.unknown,
@@ -602,7 +688,18 @@ class PrinterQueryResult {
     if (coverStatus != PrinterHwStatus.unknown) return coverStatus;
     if (paperStatus != PrinterHwStatus.unknown) return paperStatus;
     if (errorStatus != PrinterHwStatus.unknown) return errorStatus;
-    // Assume printer in ready condition
+
+    // All three unknown this round. A printer that has never once answered a
+    // status command has nothing to compare against — assume-ready is the
+    // only sane default for status-less hardware.
+    if (!hasEverResponded) return PrinterHwStatus.ready;
+
+    // This printer HAS answered before, so all-unknown now means it stopped
+    // responding rather than never supporting status — but require a couple
+    // of consecutive misses first so a single dropped poll doesn't flip a
+    // healthy printer into a false fault (which would abort/retry a receipt
+    // that actually printed fine).
+    if (consecutiveMisses >= consecutiveMissThreshold) return PrinterHwStatus.notResponding;
     return PrinterHwStatus.ready;
   }
 
@@ -617,7 +714,7 @@ class PrinterQueryResult {
 
   @override
   String toString() =>
-      'PrinterQueryResult(paperCommand=${paperCommand?.priority}, paperStatus=${paperStatus.name}, paperLastBytes=${paperLastBytes}, coverCommand=${coverCommand?.priority}, coverStatus=${coverStatus.name}, coverLastBytes=${coverLastBytes}, errorCommand=${errorCommand?.priority}, errorStatus=${errorStatus.name}, errorLastBytes=${errorLastBytes}, lastQueried=${lastQueried})';
+      'PrinterQueryResult(paperCommand=${paperCommand?.priority}, paperStatus=${paperStatus.name}, paperLastBytes=${paperLastBytes}, coverCommand=${coverCommand?.priority}, coverStatus=${coverStatus.name}, coverLastBytes=${coverLastBytes}, errorCommand=${errorCommand?.priority}, errorStatus=${errorStatus.name}, errorLastBytes=${errorLastBytes}, hasEverResponded=$hasEverResponded, consecutiveMisses=$consecutiveMisses, lastQueried=${lastQueried})';
 }
 
 extension on List<int> {
