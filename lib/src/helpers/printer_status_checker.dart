@@ -627,6 +627,61 @@ class PrinterStatusChecker {
         return PrinterHwStatus.unknown;
     }
   }
+
+  /// GS I 1 (transmit printer ID) — used ONLY as an in-order completion
+  /// barrier, never for hardware-status decoding.
+  static const List<int> _completionBarrierCommand = [0x1D, 0x49, 0x01];
+
+  /// In-order completion barrier: unlike DLE EOT (a REAL-TIME command the
+  /// printer answers immediately, jumping ahead of anything still queued —
+  /// which is why it can report "online" mid-print and proves nothing about
+  /// completion), GS I is processed IN BUFFER ORDER. Its reply can only
+  /// arrive after the printer has physically consumed everything queued
+  /// ahead of it in this call — including the receipt's own cut command.
+  /// So a reply here is a genuine physical-completion signal, for printers
+  /// that support it.
+  ///
+  /// Returns true if the printer answered within [timeout] (physically
+  /// caught up); false on timeout or any socket error, in which case the
+  /// caller should fall back to the open-loop drain estimate — this makes
+  /// enabling the barrier safe even for hardware that never replies
+  /// (status-less RONGTA-class printers): worst case it costs [timeout] of
+  /// extra latency once, it never blocks forever and never reports a false
+  /// completion.
+  static Future<bool> awaitInOrderCompletion(
+    Socket socket,
+    Stream<Uint8List> byteStream, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final completer = Completer<bool>();
+    StreamSubscription<Uint8List>? sub;
+    Timer? timer;
+
+    void finish(bool result) {
+      if (completer.isCompleted) return;
+      completer.complete(result);
+      sub?.cancel();
+      timer?.cancel();
+    }
+
+    sub = byteStream.listen(
+      (data) => finish(data.isNotEmpty),
+      onError: (_) => finish(false),
+      onDone: () => finish(false),
+      cancelOnError: true,
+    );
+    timer = Timer(timeout, () => finish(false));
+
+    try {
+      socket.add(Uint8List.fromList(_completionBarrierCommand));
+      await socket.flush();
+    } catch (e) {
+      debugPrint('(awaitInOrderCompletion) send failed: $e');
+      finish(false);
+    }
+
+    return completer.future;
+  }
 }
 
 enum PrinterStatusType { cover, paper, error }
