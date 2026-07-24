@@ -67,66 +67,6 @@ class TcpPacingConfig {
   /// receipt each extra 15ms cost >1s of wall time for no benefit.
   final int safetyMarginMs;
 
-  // ---- Burst-jam hardening (P22-4885/P22-4721 follow-up) ----
-  // All flags below default to a strict no-op so this class expansion alone
-  // cannot change existing behavior. They exist to counter a SEPARATE,
-  // deeper issue than the collateral-cascade bug fixed alongside this: even
-  // once nothing else corrupts it, a genuinely status-less/overwhelmed
-  // printer (RONGTA-class) can still be under-paced by the open-loop
-  // feed-distance estimate above, because `socket.flush()` only confirms
-  // bytes reached the printer's Wi-Fi-to-serial module — NOT that the
-  // thermal head has physically printed them. A cheap module ACKs into its
-  // own RAM at line rate, then dribbles to the head over a slow internal
-  // link; that gap is invisible to TCP flow control. These knobs let a
-  // burst-prone outlet be tuned toward the true physical throughput without
-  // touching any other outlet's behavior.
-
-  /// Master switch for the density-adaptive print-speed derate below.
-  final bool densityAdaptiveEnabled;
-
-  /// Maximum fractional print-speed slowdown at 100% raster ink coverage.
-  /// 0.5 means a fully-black stripe is paced as if the printer were running
-  /// at half [printSpeedMmPerMs] (thermal heads throttle on dense black to
-  /// avoid overheating; the mechanical top speed assumes sparse coverage).
-  final double densityDerateMax;
-
-  /// Master switch for the cumulative print-time backlog budget (leaky
-  /// bucket) below.
-  final bool backlogPacingEnabled;
-
-  /// Estimated print-time (ms) allowed to be "in flight" inside the printer
-  /// (module buffer + head) before a NEW receipt is stalled to let it drain.
-  final int backlogBudgetMs;
-
-  /// Hard clamp on any single injected stall, so a mis-tuned/very deep
-  /// backlog can never look like a hang to callers (the bloc's own 60s
-  /// per-job watchdog is the real backstop for a truly wedged printer).
-  final int backlogMaxInjectMs;
-
-  /// After this many consecutive receipts to one physical printer, pause for
-  /// [cooldownMs] before the next — mechanical/thermal relief under a
-  /// sustained burst. 0 disables.
-  final int cooldownEveryNReceipts;
-  final int cooldownMs;
-
-  /// Recycle (force-reconnect) the dedicated socket for one printer after
-  /// this many receipts, to reset a degrading Wi-Fi-to-serial module. 0
-  /// disables.
-  final int recycleEveryNReceipts;
-
-  /// Recycle the dedicated socket if it has sat idle longer than this. 0
-  /// disables.
-  final int recycleIdleMs;
-
-  /// Master switch for the in-order completion barrier (GS I / GS r — NOT
-  /// real-time DLE EOT) that replaces the open-loop end-of-receipt drain
-  /// with an actual "printer confirmed it processed everything queued
-  /// ahead, including the cut" check. Only benefits printers that respond to
-  /// status queries; inert (falls back to the open-loop drain) for
-  /// status-less hardware, so it is opt-in per outlet.
-  final bool completionBarrierEnabled;
-  final int completionBarrierTimeoutMs;
-
   const TcpPacingConfig({
     this.printSpeedMmPerMs = 0.08,
     this.dotsPerMm = 8,
@@ -134,17 +74,6 @@ class TcpPacingConfig {
     this.autocutterMechanicalMs = 500,
     this.minInterSectionMs = 30,
     this.safetyMarginMs = 20,
-    this.densityAdaptiveEnabled = false,
-    this.densityDerateMax = 0.5,
-    this.backlogPacingEnabled = false,
-    this.backlogBudgetMs = 4000,
-    this.backlogMaxInjectMs = 8000,
-    this.cooldownEveryNReceipts = 0,
-    this.cooldownMs = 3000,
-    this.recycleEveryNReceipts = 0,
-    this.recycleIdleMs = 0,
-    this.completionBarrierEnabled = false,
-    this.completionBarrierTimeoutMs = 6000,
   });
 }
 
@@ -226,10 +155,6 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
 
   // ESC d 3 (feed 3 lines) + GS V 0 (full cut) — the defensive cut above.
   static const List<int> _defensiveCut = [0x1B, 0x64, 0x03, 0x1D, 0x56, 0x00];
-
-  // Per-IP burst-jam pacing state (backlog leaky-bucket, cooldown/recycle
-  // counters) — see [_IpPacingState] and [TcpPacingConfig].
-  final Map<String, _IpPacingState> _ipPacing = {};
 
   // Connect to printers using shared socket (_socket)
   @override
@@ -718,29 +643,6 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         throw SocketException('$ip Socket is null after lock acquired');
       }
 
-      final pace = _ipPacing.putIfAbsent(ip, () => _IpPacingState());
-
-      // Periodic socket recycling: a dedicated socket that stays open across
-      // a long burst is exactly what stresses a cheap Wi-Fi-to-serial module
-      // (RONGTA-class). Forcing a clean reconnect every so often (or after
-      // sitting idle) resets the module's internal state without giving up
-      // the "keep the socket open" pacing benefit for the common case.
-      // Runs under the IP lock and reuses the already-vetted reconnect path,
-      // so it carries no correctness risk beyond the reconnect itself. Only
-      // applies to the persistent dedicated-socket path.
-      if (useDedicatedSocket) {
-        final idleMs = DateTime.now().difference(pace.lastSendAt).inMilliseconds;
-        final overCount =
-            pacing.recycleEveryNReceipts > 0 && pace.receiptsSinceRecycle >= pacing.recycleEveryNReceipts;
-        final overIdle = pacing.recycleIdleMs > 0 && idleMs >= pacing.recycleIdleMs;
-        if (overCount || overIdle) {
-          _log('$ip recycling dedicated socket (receipts=${pace.receiptsSinceRecycle}, idleMs=$idleMs)',
-              level: 'warn');
-          socket = await _reconnectSocket(model, useDedicatedSocket);
-          pace.receiptsSinceRecycle = 0;
-        }
-      }
-
       try {
         socket.setOption(SocketOption.tcpNoDelay, true);
       } catch (e) {
@@ -785,53 +687,6 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         await Future.delayed(Duration(milliseconds: pacing.autocutterMechanicalMs));
       }
 
-      // Periodic cooldown under sustained load: after N back-to-back
-      // receipts to this IP, pause for a few seconds before continuing —
-      // mechanical/thermal relief (lets the head shed heat, lets the
-      // module's internal serial link fully drain) that the per-receipt
-      // pacing below cannot provide on its own.
-      if (pacing.cooldownEveryNReceipts > 0 && pace.receiptsSinceCooldown >= pacing.cooldownEveryNReceipts) {
-        _log('$ip sustained-load cooldown after ${pace.receiptsSinceCooldown} receipts — pausing ${pacing.cooldownMs}ms',
-            level: 'warn');
-        await Future.delayed(Duration(milliseconds: pacing.cooldownMs));
-        pace.receiptsSinceCooldown = 0;
-        pace.backlogMs = 0; // printer has caught up; the bucket estimate is now stale, reset it
-      }
-
-      // Cumulative print-time backlog budget (leaky bucket). The per-section
-      // pacing below assumes THIS receipt starts with an empty printer
-      // buffer, but `socket.flush()` completing only proves bytes reached
-      // the printer's Wi-Fi-to-serial module — not that the thermal head has
-      // physically caught up. Track estimated print-time still "in flight"
-      // inside the printer, drain it by real elapsed wall time, and stall a
-      // NEW receipt if the estimated backlog already exceeds one buffer's
-      // worth. This is what actually prevents the open-loop drift from
-      // compounding over a 200+ receipt burst; everything else here is
-      // either a one-off correction (density) or periodic relief (cooldown).
-      if (pacing.backlogPacingEnabled) {
-        var estimatedReceiptMs = 0;
-        for (final s in bytes) {
-          estimatedReceiptMs += _sectionPrintMs(s, isImageBased);
-        }
-        estimatedReceiptMs += pacing.autocutterMechanicalMs;
-
-        final now = DateTime.now();
-        pace.backlogMs = max(0, pace.backlogMs - now.difference(pace.lastUpdate).inMilliseconds);
-        pace.lastUpdate = now;
-
-        if (pace.backlogMs > pacing.backlogBudgetMs) {
-          final inject = (pace.backlogMs - pacing.backlogBudgetMs).round().clamp(0, pacing.backlogMaxInjectMs);
-          if (inject > 0) {
-            _log('$ip backlog ${pace.backlogMs.round()}ms > budget ${pacing.backlogBudgetMs}ms — injecting ${inject}ms before receipt',
-                level: 'warn');
-            await Future.delayed(Duration(milliseconds: inject));
-            pace.backlogMs = max(0, pace.backlogMs - inject);
-          }
-        }
-        pace.backlogMs += estimatedReceiptMs;
-        pace.lastUpdate = DateTime.now();
-      }
-
       int totalSize = bytes.fold(0, (sum, section) => sum + section.length);
       _log(
           '2. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} sending ${bytes.length} sections, total size: $totalSize bytes');
@@ -869,40 +724,14 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         }
       }
 
-      // End-of-receipt: confirm the receipt (including its cut) has
-      // physically finished before releasing the socket/lock, so the next
-      // receipt on this IP can't begin while the cut is still mid-travel
-      // (mid-receipt cut / overlap under burst).
-      //
-      // Prefer a real confirmation (the in-order completion barrier) when
-      // enabled: it paces to the printer's TRUE throughput and eliminates
-      // the open-loop estimate's cumulative drift entirely. It is opt-in and
-      // inert-safe for status-less hardware (RONGTA-class, the printer
-      // actually jamming under burst in the field data this was built
-      // against) — such a printer simply never replies, the barrier times
-      // out, and this falls straight through to the existing open-loop
-      // drain below, so enabling the flag can never make that printer worse.
-      var barrierConfirmed = false;
-      if (pacing.completionBarrierEnabled) {
-        final bs = useDedicatedSocket ? _socketRegistry[ip]!.byteStream : _byteStreamFor(socket);
-        barrierConfirmed = await PrinterStatusChecker.awaitInOrderCompletion(
-          socket,
-          bs,
-          timeout: Duration(milliseconds: pacing.completionBarrierTimeoutMs),
-        );
-        if (barrierConfirmed) {
-          _log('$ip completion barrier confirmed', level: 'info');
-          pace.backlogMs = 0; // confirmed drained — the open-loop estimate is now stale
-        }
-      }
-      if (!barrierConfirmed) {
-        // Open-loop fallback: barrier disabled, or this printer didn't
-        // answer (status-less hardware, or a slow reply past the timeout).
-        final drainMs = bytes.isNotEmpty
-            ? _endOfReceiptDrainMs(bytes.last, isImageBased)
-            : pacing.autocutterMechanicalMs;
-        await Future.delayed(Duration(milliseconds: drainMs));
-      }
+      // End-of-receipt drain: wait for the final section (cut + trailing feed)
+      // to physically print and the autocutter to fire before releasing the
+      // socket/lock. Otherwise the next receipt on this IP can begin while the
+      // cut is still mid-travel → mid-receipt cut / overlap under burst.
+      final drainMs = bytes.isNotEmpty
+          ? _endOfReceiptDrainMs(bytes.last, isImageBased)
+          : pacing.autocutterMechanicalMs;
+      await Future.delayed(Duration(milliseconds: drainMs));
 
       _log('4. splitSendV2 $ip${useDedicatedSocket ? '' : ' (shared)'} Successfully sent all ${bytes.length} print sections',
           level: 'warn');
@@ -916,12 +745,6 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
           cacheTtl: 5,
         );
       }
-
-      // Successful send — advance the cross-receipt pacing counters used by
-      // cooldown/recycle above.
-      pace.receiptsSinceCooldown++;
-      pace.receiptsSinceRecycle++;
-      pace.lastSendAt = DateTime.now();
 
       return PrinterConnectStatusResult(
         isSuccess: true,
@@ -1227,26 +1050,7 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     }
     final ips = List<String>.from(_socketRegistry.keys);
     for (final ip in ips) {
-      // Acquire the per-IP lock FIRST so a bulk teardown (e.g. the app's
-      // resetPrinterConnections()) can never close a socket while
-      // splitSendV2 is mid-receipt on it. Before this fix, a single
-      // misbehaving printer's error-recovery reset would race an in-flight
-      // send on a completely different, healthy printer: the reset closed
-      // that printer's socket out from under it, the next socket.add() threw
-      // "Bad state: StreamSink is closed", and the healthy receipt aborted
-      // (defensive-cut blank strip + full atomic retry) for no reason of its
-      // own (P22-4885 field data, RONGTA burst). A plain await here is safe
-      // and bounded — it waits at most one in-flight receipt on this IP,
-      // exactly like disconnectDedicatedSocket already does. Do NOT wrap
-      // this in .timeout(): _acquireLock's wait loop keeps running after a
-      // timeout throws and would leave a Completer nobody releases, wedging
-      // this IP's lock forever.
-      await _acquireLock(ip);
-      try {
-        await _closeIpDedicatedSocket(ip);
-      } finally {
-        _releaseLock(ip);
-      }
+      await _closeIpDedicatedSocket(ip);
     }
   }
 
@@ -1409,60 +1213,12 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
   }
 
   /// Estimated milliseconds for the printer to physically render [section].
-  ///
-  /// When [TcpPacingConfig.densityAdaptiveEnabled] is on, the mechanical top
-  /// speed [TcpPacingConfig.printSpeedMmPerMs] is derated by measured raster
-  /// ink coverage: thermal heads throttle on dense black to avoid
-  /// overheating, so a near-solid-black stripe (a logo, a dense QR) physically
-  /// prints slower than a sparse one, even though both cover the same feed
-  /// distance. Before this, the pacing formula priced every stripe at the
-  /// same worst-CASE-mechanical speed regardless of density — the single
-  /// largest source of under-pacing drift on image-heavy receipts.
   int _sectionPrintMs(List<int> section, bool isImageBased) {
     final cfg = pacing;
     final feedDots = _estimateFeedDots(section, isImageBased);
     if (feedDots <= 0) return cfg.minInterSectionMs;
     final feedMm = feedDots / cfg.dotsPerMm;
-
-    var speed = cfg.printSpeedMmPerMs;
-    if (cfg.densityAdaptiveEnabled && isImageBased) {
-      final coverage = _rasterCoverage(section); // 0.0 (blank) .. 1.0 (solid black)
-      speed = cfg.printSpeedMmPerMs * (1 - cfg.densityDerateMax * coverage);
-    }
-    return max((feedMm / speed).ceil(), cfg.minInterSectionMs);
-  }
-
-  /// Fraction of raster dots that are SET (fired/black) across all ESC *
-  /// stripe commands in [section] — a cheap proxy for thermal ink coverage.
-  /// Single linear pass; skips the 4-byte `ESC * m nL nH` stripe headers.
-  double _rasterCoverage(List<int> section) {
-    var totalBits = 0;
-    var darkBits = 0;
-    var i = 0;
-    while (i < section.length - 1) {
-      if (section[i] == 0x1B && section[i + 1] == 0x2A && i + 4 < section.length) {
-        final nL = section[i + 3];
-        final nH = section[i + 4];
-        final columns = nL + nH * 256;
-        final payloadBytes = columns * 3; // 24-dot stripe mode: 3 bytes/column
-        final start = i + 5;
-        final end = min(start + payloadBytes, section.length);
-        for (var b = start; b < end; b++) {
-          darkBits += _popcount(section[b]);
-          totalBits += 8;
-        }
-        i = end;
-      } else {
-        i++;
-      }
-    }
-    return totalBits == 0 ? 0.0 : darkBits / totalBits;
-  }
-
-  int _popcount(int byte) {
-    var b = byte - ((byte >> 1) & 0x55);
-    b = (b & 0x33) + ((b >> 2) & 0x33);
-    return (b + (b >> 4)) & 0x0F;
+    return max((feedMm / cfg.printSpeedMmPerMs).ceil(), cfg.minInterSectionMs);
   }
 
   /// Physical feed distance of a section, in printer dots. For raster, counts
@@ -1517,30 +1273,5 @@ class _SocketEntry {
     required this.connectedAt,
     this.status = TCPStatus.connected,
   });
-}
-
-/// Cross-receipt pacing state for one physical printer (keyed by IP). See
-/// the burst-jam hardening fields on [TcpPacingConfig] for what each of
-/// these drives.
-class _IpPacingState {
-  /// Estimated print-time (ms) still queued inside the printer (module
-  /// buffer + head) — a leaky bucket. Grows by each receipt's estimated
-  /// print time (priced the same way as inter-section pacing), drains by
-  /// real wall-clock elapsed time since the last update. This is deliberately
-  /// tracked in estimated PRINT TIME, not bytes: raster bytes are not
-  /// proportional to physical feed distance, so a byte-count budget would
-  /// mis-price image-heavy receipts the same way the old distance-only
-  /// pacing formula did.
-  double backlogMs = 0;
-  DateTime lastUpdate = DateTime.now();
-
-  /// Receipts sent since the last cooldown pause / since the last socket
-  /// recycle, for this IP.
-  int receiptsSinceCooldown = 0;
-  int receiptsSinceRecycle = 0;
-
-  /// Wall-clock time this IP last had a receipt sent to it — used for
-  /// idle-based socket recycling.
-  DateTime lastSendAt = DateTime.now();
 }
 
