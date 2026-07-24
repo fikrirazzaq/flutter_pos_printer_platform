@@ -67,6 +67,24 @@ class TcpPacingConfig {
   /// receipt each extra 15ms cost >1s of wall time for no benefit.
   final int safetyMarginMs;
 
+  /// Fixed (NOT payload-scaled) settle applied only on the abort-recovery
+  /// path, before the defensive cut is sent — i.e. only when a previous
+  /// receipt to this IP aborted mid-send. It exists to let a status-less
+  /// printer (a) finish draining its own internal buffer from the aborted
+  /// attempt and (b) hit its firmware's per-command inter-byte timeout and
+  /// abandon the truncated fixed-length raster command it was mid-way
+  /// through, before any new bytes (the cut, then the fresh receipt) arrive.
+  /// Without this, the cut and the head of the retry get consumed as pixel
+  /// data for the stale command instead of being read as commands.
+  ///
+  /// Deliberately not scaled to unsent bytes/sections: what this waits out
+  /// (bounded buffer drain + a firmware timeout) does not scale with payload
+  /// size. This is a mitigation for a quick/mild stall only — it is NOT
+  /// sufficient for a genuine hard jam that leaves the printer unresponsive
+  /// for minutes; that case must be handled by the caller refusing to
+  /// auto-retry into it, not by waiting longer here.
+  final int abortRecoverySettleMs;
+
   const TcpPacingConfig({
     this.printSpeedMmPerMs = 0.08,
     this.dotsPerMm = 8,
@@ -74,6 +92,7 @@ class TcpPacingConfig {
     this.autocutterMechanicalMs = 500,
     this.minInterSectionMs = 30,
     this.safetyMarginMs = 20,
+    this.abortRecoverySettleMs = 3000,
   });
 }
 
@@ -676,6 +695,11 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
       // so the two never merge (overlap / header-in-wrong-receipt / mid cut).
       // Done only after a real abort, and only once the printer checked ready.
       if (_abortedIps.remove(ip)) {
+        // Settle before the cut, not after: the printer's parser must
+        // drain/abandon the stale truncated command before any new bytes
+        // arrive, or those bytes (the cut, then the fresh receipt) get read
+        // as pixel data for the old command instead of as commands.
+        await Future.delayed(Duration(milliseconds: pacing.abortRecoverySettleMs));
         _log('$ip prior receipt aborted — prepending defensive cut', level: 'warn');
         await _sendDataSection(
           socket: socket,
@@ -1050,7 +1074,17 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
     }
     final ips = List<String>.from(_socketRegistry.keys);
     for (final ip in ips) {
-      await _closeIpDedicatedSocket(ip);
+      // Hold the per-IP lock during teardown so a bulk reset can't close a
+      // socket out from under a splitSendV2 still mid-receipt on that IP.
+      // Do not wrap this in .timeout(): _acquireLock's wait loop keeps
+      // running after a timeout throws, stranding a Completer nobody
+      // releases and permanently wedging that IP's lock.
+      await _acquireLock(ip);
+      try {
+        await _closeIpDedicatedSocket(ip);
+      } finally {
+        _releaseLock(ip);
+      }
     }
   }
 
