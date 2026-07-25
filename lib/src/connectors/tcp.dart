@@ -1100,8 +1100,33 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
    * Callers await _acquireLock, do their work, then call _releaseLock.
    */
   Future<void> _acquireLock(String ip) async {
+    final requestedAt = DateTime.now();
+    var loggedWait = false;
     while (_ipLocks.containsKey(ip)) {
-      await _ipLocks[ip]!.future;
+      final holder = _ipLocks[ip]!;
+      var released = false;
+      unawaited(holder.future.then((_) => released = true));
+      // Purely observational polling — does NOT change how long we actually
+      // wait. A stuck earlier holder (e.g. the disconnectDedicatedSocket bug
+      // this codebase used to have) previously showed up only as an absence
+      // of splitSendV2 logs, diagnosable only by correlating watchdog
+      // timestamps after the fact. This surfaces it the moment it starts.
+      while (!released) {
+        await Future.any<void>([
+          holder.future,
+          Future<void>.delayed(const Duration(seconds: 5)),
+        ]);
+        if (!released) {
+          loggedWait = true;
+          _log(
+            '$ip still waiting for per-IP transport lock after ${DateTime.now().difference(requestedAt).inSeconds}s — a stuck earlier operation may be holding it',
+            level: 'warn',
+          );
+        }
+      }
+    }
+    if (loggedWait) {
+      _log('$ip acquired per-IP transport lock after ${DateTime.now().difference(requestedAt).inSeconds}s wait', level: 'warn');
     }
     _ipLocks[ip] = Completer<void>();
   }
