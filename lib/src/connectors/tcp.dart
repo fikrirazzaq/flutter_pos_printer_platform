@@ -985,9 +985,16 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         await Future.delayed(Duration(milliseconds: delayMs));
       }
       await _acquireLock(printerIp);
-      await _closeIpDedicatedSocket(printerIp);
-      _releaseLock(printerIp);
-      return true;
+      try {
+        await _closeIpDedicatedSocket(printerIp);
+        return true;
+      } finally {
+        // Must run even if _closeIpDedicatedSocket throws — this was the one
+        // lock-acquire site in the file that released outside a `finally`,
+        // which could strand the per-IP lock forever and wedge every future
+        // print/reconnect attempt on this printer until the app restarts.
+        _releaseLock(printerIp);
+      }
     } catch (e, s) {
       _log('$printerIp Error during disconnect: $e', level: 'error', error: e, stackTrace: s);
       return false;
