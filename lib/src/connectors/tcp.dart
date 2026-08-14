@@ -273,7 +273,29 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         return PrinterConnectStatusResult(isSuccess: false, exception: 'socket is not established');
       }
       socket.add(Uint8List.fromList(bytes));
-      await socket.flush();
+      try {
+        await socket.flush().timeout(const Duration(seconds: 5));
+      } on TimeoutException {
+        // Same reasoning as splitSend's flush timeout: flush() waits for the
+        // printer to ACK all pending data over TCP. A half-open socket never
+        // gets that ACK, so without this timeout flush() can hang far longer
+        // than any caller should reasonably wait — and since this plain
+        // send() is also the one path callers await directly instead of
+        // through the queue's watchdog (see print_bloc.dart's testPrint/
+        // openCashDrawerOnly), an unbounded hang here used to be able to
+        // wedge the caller's entire event pipeline. The socket's sink is now
+        // in a dangling async state and cannot be reused — destroy
+        // immediately so the next attempt gets a fresh connection instead of
+        // reusing a half-dead one.
+        _log('$ip flush timed out on plain send() — destroying socket', level: 'warn');
+        socket.destroy();
+        if (useDedicatedSocket) {
+          _socketRegistry.remove(ip);
+        } else {
+          _socket = null;
+        }
+        return PrinterConnectStatusResult(isSuccess: false, exception: 'Flush timed out - printer may be busy');
+      }
       return PrinterConnectStatusResult(isSuccess: true);
     } catch (e, stackTrace) {
       if (useDedicatedSocket) {
@@ -689,18 +711,29 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
         }
       }
 
-      // Defensive cut: if the previous receipt to this IP aborted mid-send, its
-      // partial bytes may still sit in the printer's buffer (ESC @ does not
-      // clear it). Sever them onto their own slip before this receipt's content
-      // so the two never merge (overlap / header-in-wrong-receipt / mid cut).
-      // Done only after a real abort, and only once the printer checked ready.
-      if (_abortedIps.remove(ip)) {
-        // Settle before the cut, not after: the printer's parser must
-        // drain/abandon the stale truncated command before any new bytes
-        // arrive, or those bytes (the cut, then the fresh receipt) get read
-        // as pixel data for the old command instead of as commands.
-        await Future.delayed(Duration(milliseconds: pacing.abortRecoverySettleMs));
-        _log('$ip prior receipt aborted — prepending defensive cut', level: 'warn');
+      // Defensive cut: sever any content the printer may not have fully cut
+      // from a previous receipt before this one's bytes arrive. Two triggers:
+      //  1. A previous receipt to this IP aborted mid-send — its partial
+      //     bytes may still sit in the printer's buffer (ESC @ does not
+      //     clear it), and the printer's parser needs to drain/abandon that
+      //     stale truncated command before any new bytes arrive, or the cut
+      //     + fresh receipt get read as pixel data for the old command.
+      //  2. Image-based receipts: the end of the *previous* receipt only
+      //     waited a timed estimate (_endOfReceiptDrainMs), not a real
+      //     confirmation, for its own cut to physically finish — a
+      //     momentarily slow/stalled cutter can silently miss that window
+      //     with nothing throwing, leaving this receipt's header printed on
+      //     the same uncut strip as the previous one's footer. Run this
+      //     unconditionally for image-based receipts so a silently-failed
+      //     cut is neutralized regardless of cause, not only when the send
+      //     layer itself detected an abort.
+      final priorAborted = _abortedIps.remove(ip);
+      if (priorAborted || isImageBased) {
+        if (priorAborted) {
+          // Settle before the cut, not after — see trigger 1 above.
+          await Future.delayed(Duration(milliseconds: pacing.abortRecoverySettleMs));
+          _log('$ip prior receipt aborted — prepending defensive cut', level: 'warn');
+        }
         await _sendDataSection(
           socket: socket,
           model: model,
