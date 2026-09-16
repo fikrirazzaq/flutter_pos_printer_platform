@@ -1124,6 +1124,14 @@ class TcpPrinterConnector implements PrinterConnector<TcpPrinterInput> {
    */
   Future<void> _closeIpDedicatedSocket(String ip) async {
     final entry = _socketRegistry.remove(ip);
+    // Any status profile learned over the socket being torn down (or a
+    // no-op call for an ip that already has none) is stale for whatever
+    // connects next — a printer swap behind the same IP, a printer that has
+    // since recovered from offline, or simply a fresh connect after
+    // unassign/reassign. Always drop it here rather than only on success,
+    // so the next connection re-probes from scratch instead of inheriting a
+    // profile keyed to a command the printer may no longer answer.
+    PrinterStatusChecker.invalidateForIp(ip);
     if (entry == null) return;
     try {
       await entry.socket.close().timeout(const Duration(milliseconds: 500));

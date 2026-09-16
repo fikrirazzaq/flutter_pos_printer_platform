@@ -10,3 +10,4 @@ export './src/printers/tspl.dart';
 export './printer.dart';
 export './src/printer_manager.dart';
 export './src/models/printer_device.dart';
+export './src/helpers/printer_status_checker.dart' show PrinterStatusChecker, PrinterQueryResult;

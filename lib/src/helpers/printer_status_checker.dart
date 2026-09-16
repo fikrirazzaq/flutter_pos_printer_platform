@@ -213,6 +213,30 @@ class PrinterStatusChecker {
   }
 
   static final Map<String, PrinterQueryResult> _queryResultCache = {};
+
+  /// Drops any cached [PrinterQueryResult] (and legacy [checkStatus] working
+  /// command) keyed to [ip], on any port. The cache is `static` and keyed by
+  /// `ip:port` with no TTL-driven eviction, so a profile that has drifted
+  /// onto a command the printer no longer answers (e.g. after a firmware
+  /// reset, a printer swap behind the same IP, or the printer recovering
+  /// from an offline condition) otherwise never gets a clean re-probe for
+  /// the life of the process. Call this whenever the transport-level
+  /// connection to [ip] is torn down (see `_closeIpDedicatedSocket`) so the
+  /// next connection starts from a fresh profile instead of an inherited
+  /// one.
+  static void invalidateForIp(String ip) {
+    _queryResultCache.removeWhere((key, _) => key.startsWith('$ip:'));
+    _workingCommands.removeWhere((key, _) => key.startsWith('$ip:'));
+  }
+
+  /// Read-only lookup of the last [PrinterQueryResult] learned for
+  /// [printerKey] (`ip:port`), without triggering a probe or requiring a
+  /// live [Socket]. For UI surfaces (e.g. a printer settings list) that want
+  /// to show *why* a reachable printer isn't actually printing — a plain
+  /// TCP-reachability check has no way to know a printer is paper-out or
+  /// mid-error, since it accepts new connections regardless.
+  static PrinterQueryResult? lastKnownStatus(String printerKey) => _queryResultCache[printerKey];
+
   static const List<PrinterStatusCommand> _probeCommands = [
     PrinterStatusCommand(
       statusType: PrinterStatusType.cover,
@@ -521,9 +545,18 @@ class PrinterStatusChecker {
 
   static bool _isGenuineResponse(List<int> command, int response) {
     if (!_isDleEotCommand(command)) return true; // no fixed-bit spec to check
+    // ESC/POS fixes DLE EOT n reply bit4 to 1 (not 0) across all four
+    // sub-commands. The prior `== 0x00` check here had the polarity
+    // inverted, so it rejected every spec-compliant reply a real printer
+    // could ever send — e.g. the canonical all-OK byte 0x12 (0b0001_0010,
+    // bit4 set) was discarded as "non-genuine" on every printer, which left
+    // cover/error status permanently unlearnable (only DLE EOT probes them)
+    // and, combined with a paper-out printer going silent on the buffered
+    // GS r / ESC v fallbacks, made every status look "notResponding" even
+    // though the printer had just answered correctly.
     return (response & 0x01) == 0x00 &&
         (response & 0x02) == 0x02 &&
-        (response & 0x10) == 0x00 &&
+        (response & 0x10) == 0x10 &&
         (response & 0x80) == 0x00;
   }
 
