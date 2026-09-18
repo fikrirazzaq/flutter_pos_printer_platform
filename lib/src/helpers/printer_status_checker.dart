@@ -598,7 +598,17 @@ class PrinterStatusChecker {
       );
       timeout = Timer(const Duration(milliseconds: 300), () => stopListeningResponse());
       socket.add(command);
-      await socket.flush();
+      // The 300ms Timer above only bounds the wait for a reply — it does not
+      // bound this flush() call itself. Against a socket that has gone
+      // silently half-open (no RST/FIN, e.g. a dead Wi-Fi bridge module, or
+      // another client contending for the same printer's single connection),
+      // flush() can hang indefinitely waiting for a TCP ACK that will never
+      // arrive. That leaves this function (and therefore splitSendV2's whole
+      // per-IP lock, held for its entire duration) stuck forever — the BLoC's
+      // job watchdog can only clear its own bookkeeping and cannot force this
+      // await to resolve, nor can its own recovery reconnect since that also
+      // needs this same per-IP lock. Bound it here, at the actual hang point.
+      await socket.flush().timeout(const Duration(seconds: 5));
     } catch (e) {
       debugPrint('(queryPrinterStatus) _getStatusResponse Err $e');
       stopListeningResponse();
